@@ -18,6 +18,7 @@ import json
 import os
 import threading
 import weakref
+from collections.abc import Mapping
 from queue import Empty
 from typing import Dict, List, Optional, Union
 
@@ -25,6 +26,9 @@ import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm._torch.pyexecutor.connectors.remote_g2 import (
+    target_remote_g2_plan_store,
+)
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -539,6 +543,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
+        remote_g2_plan: Optional[Mapping[str, object]] = getattr(
+            request, "remote_g2_plan", None
+        )
+        remote_g2_plan_registered = False
 
         result = GenerationResult(
             request,
@@ -548,8 +556,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             logprob_params=logprob_params)
         self._results[request.id] = result
 
-        with nvtx_range_debug("request_queue.put"):
-            self.request_queue.put(request)
+        try:
+            if remote_g2_plan is not None:
+                remote_g2_plan_registered = (
+                    target_remote_g2_plan_store().put(request.id, remote_g2_plan)
+                    is not None
+                )
+
+            with nvtx_range_debug("request_queue.put"):
+                self.request_queue.put(request)
+        except Exception:
+            if remote_g2_plan_registered:
+                target_remote_g2_plan_store().discard(request.id)
+            raise
 
         self._handle_background_error()
 
