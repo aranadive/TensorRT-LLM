@@ -443,6 +443,7 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        remote_g2_plan: Optional[Mapping[str, Any]] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -460,6 +461,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            remote_g2_plan (Mapping[str, Any], optional): Router-planned remote G2 reuse metadata registered by request id before executor scheduling.
 
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
@@ -523,6 +525,7 @@ class BaseLLM:
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
             priority=priority,
+            remote_g2_plan=remote_g2_plan,
         )
 
         if sampling_params.return_perf_metrics:

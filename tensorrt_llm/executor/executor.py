@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+from typing import (TYPE_CHECKING, Any, AsyncIterable, Dict, Generator, List,
                     Optional, Union)
 
 import numpy as np
@@ -137,6 +137,7 @@ class GenerationExecutor(ABC):
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        remote_g2_plan: Optional[Mapping[str, Any]] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -165,6 +166,8 @@ class GenerationExecutor(ABC):
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
             priority=priority)
+        if remote_g2_plan is not None:
+            request.remote_g2_plan = remote_g2_plan
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
