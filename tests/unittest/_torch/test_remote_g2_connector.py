@@ -22,6 +22,14 @@ _REMOTE_G2_CONNECTOR_PATH = (
     / "connectors"
     / "remote_g2_connector.py"
 )
+_REMOTE_G2_TRANSFER_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_transfer.py"
+)
 
 
 def _install_package(name):
@@ -71,18 +79,22 @@ def _load_connector_modules():
     sys.modules[f"{_CONNECTOR_PACKAGE}.kv_cache_connector"] = kv_cache_connector
 
     remote_g2 = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2", _REMOTE_G2_PATH)
+    remote_g2_transfer = _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
+    )
     remote_g2_connector = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH
     )
-    return remote_g2, remote_g2_connector
+    return remote_g2, remote_g2_transfer, remote_g2_connector
 
 
-REMOTE_G2, REMOTE_G2_CONNECTOR = _load_connector_modules()
+REMOTE_G2, REMOTE_G2_TRANSFER, REMOTE_G2_CONNECTOR = _load_connector_modules()
 
 RemoteG2ConnectorMetadata = REMOTE_G2_CONNECTOR.RemoteG2ConnectorMetadata
 RemoteG2Descriptor = REMOTE_G2.RemoteG2Descriptor
 RemoteG2ResolveResult = REMOTE_G2.RemoteG2ResolveResult
 TargetRemotePlanStore = REMOTE_G2.TargetRemotePlanStore
+TargetRemoteG2BindingStore = REMOTE_G2.TargetRemoteG2BindingStore
 
 
 def _plan(**overrides):
@@ -121,6 +133,42 @@ def _resolve_result(block_hashes=(11, 22, 33), num_tokens=48, lease_id="lease-1"
         num_tokens=num_tokens,
         source_generation=99,
     )
+
+
+class _FakeTransferResult:
+    def __init__(self, record, completed=True, fail=False):
+        self.record = record
+        self.completed = completed
+        self.fail = fail
+
+    def is_completed(self):
+        if self.fail:
+            raise RuntimeError("transfer failed")
+        return self.completed
+
+
+class _FakeTransferAdapter:
+    def __init__(self, result_factory=None):
+        self.started = []
+        self.result_factory = result_factory
+
+    def start_transfer(self, record):
+        self.started.append(record)
+        if self.result_factory is not None:
+            return self.result_factory(record)
+        return _FakeTransferResult(record)
+
+
+def _bound_record(lease_id="lease-bound"):
+    store = TargetRemoteG2BindingStore(release_lease=lambda lease_id, reason: True)
+    record = store.resolve_for_request(
+        1234,
+        _plan(),
+        16,
+        lambda plan: _resolve_result(lease_id=lease_id),
+    )
+    store.bind_target_blocks(1234, [100, 101, 102])
+    return record
 
 
 def test_remote_g2_connector_resolves_before_reporting_tokens():
@@ -240,14 +288,92 @@ def test_remote_g2_worker_refuses_transfer_before_phase5():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata())
     worker.start_load_kv(None)
 
-    worker.bind_connector_meta(
-        RemoteG2ConnectorMetadata(
-            bindings=(
-                SimpleNamespace(bound_blocks=(SimpleNamespace(target_block_id=100),)),
-            )
-        )
-    )
-    with pytest.raises(
-        RuntimeError, match="remote G2 transfer is not available before Phase 5"
-    ):
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    with pytest.raises(RuntimeError, match="transfer adapter is not configured"):
         worker.start_load_kv(None)
+
+
+def test_remote_g2_worker_starts_transfer_for_bound_metadata():
+    adapter = _FakeTransferAdapter()
+    record = _bound_record()
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=adapter,
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(record,)))
+    worker.start_load_kv(None)
+    worker.start_load_kv(None)
+
+    assert adapter.started == [record]
+
+
+def test_remote_g2_worker_reports_finished_only_after_transfer_success():
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=False)
+        return result
+
+    released = []
+    adapter = _FakeTransferAdapter(make_result)
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=adapter,
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    record = _bound_record()
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(record,)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [])
+    result.completed = True
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    assert released == [("lease-bound", "transfer_succeeded")]
+
+
+def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
+    released = []
+    published = []
+    adapter = _FakeTransferAdapter(
+        lambda record: _FakeTransferResult(record, completed=False, fail=True)
+    )
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=adapter,
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=published.append,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        worker.get_finished([], [1234])
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert released == [("lease-bound", "transfer_failed")]
+    assert published == []
+
+
+def test_remote_g2_worker_publishes_after_local_validity():
+    order = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: order.append(f"release:{reason}") or True,
+        mark_local_valid=lambda record: order.append("valid"),
+        publish_binding=lambda record: order.append("publish"),
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    assert order == ["valid", "publish", "release:transfer_succeeded"]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -19,6 +20,7 @@ from .remote_g2 import (
     TargetRemotePlanStore,
     target_remote_g2_plan_store,
 )
+from .remote_g2_transfer import RemoteG2TransferError
 
 
 @dataclass(frozen=True)
@@ -97,13 +99,50 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 
 
 class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
+    def __init__(
+        self,
+        llm_args: Any,
+        *,
+        transfer_adapter: Optional[Any] = None,
+        release_lease: Optional[Callable[[str, str], bool]] = None,
+        mark_local_valid: Optional[Callable[[RemoteG2BindingRecord], None]] = None,
+        publish_binding: Optional[Callable[[RemoteG2BindingRecord], None]] = None,
+        transfer_timeout_ms: int = 30_000,
+    ) -> None:
+        super().__init__(llm_args)
+        self._transfer_adapter = transfer_adapter
+        self._release_lease = release_lease or _missing_release_lease
+        self._mark_local_valid = mark_local_valid
+        self._publish_binding = publish_binding
+        self._transfer_timeout_ms = transfer_timeout_ms
+        self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
+        self._completed_loads: set[int | str] = set()
+        self._released_leases: set[str] = set()
+
     def register_kv_caches(self, kv_cache_tensor: Any) -> None:
         self._kv_cache_tensor = kv_cache_tensor
 
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
-        if isinstance(metadata, RemoteG2ConnectorMetadata) and metadata.bindings:
-            raise RuntimeError("remote G2 transfer is not available before Phase 5")
+        if not isinstance(metadata, RemoteG2ConnectorMetadata) or not metadata.bindings:
+            return
+        if self._transfer_adapter is None:
+            for record in metadata.bindings:
+                self._release_record_once(record, "transfer_adapter_missing")
+            raise RuntimeError("remote G2 transfer adapter is not configured")
+
+        for record in metadata.bindings:
+            request_id = record.request_id
+            if request_id in self._active_loads or request_id in self._completed_loads:
+                continue
+            try:
+                result = self._transfer_adapter.start_transfer(record)
+            except Exception as exc:
+                self._release_record_once(record, "transfer_start_failed")
+                raise RuntimeError("remote G2 transfer failed to start") from exc
+            self._active_loads[request_id] = _RemoteG2ActiveLoad(
+                result=result, started_at_ms=_now_ms()
+            )
 
     def wait_for_layer_load(self, layer_idx: int, stream: Any) -> None:
         return
@@ -117,4 +156,52 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     def get_finished(
         self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
     ) -> tuple[list[int], list[int]]:
-        return ([], [])
+        finished_loading: list[int] = []
+        for request_id in started_loading_req_ids:
+            active = self._active_loads.get(request_id)
+            if active is None:
+                continue
+            record = active.result.record
+            try:
+                if active.result.is_completed():
+                    self._complete_success(record)
+                    self._active_loads.pop(request_id, None)
+                    self._completed_loads.add(request_id)
+                    finished_loading.append(int(request_id))
+                elif _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
+                    self._active_loads.pop(request_id, None)
+                    self._release_record_once(record, "transfer_timeout")
+                    raise RuntimeError("remote G2 transfer timed out")
+            except Exception as exc:
+                self._active_loads.pop(request_id, None)
+                self._release_record_once(record, "transfer_failed")
+                raise RuntimeError("remote G2 transfer failed closed") from exc
+        return ([], finished_loading)
+
+    def _complete_success(self, record: RemoteG2BindingRecord) -> None:
+        if self._mark_local_valid is None:
+            self._release_record_once(record, "local_validity_missing")
+            raise RemoteG2TransferError("remote G2 local validity hook is not configured")
+        if self._publish_binding is None:
+            self._release_record_once(record, "publication_missing")
+            raise RemoteG2TransferError("remote G2 publication hook is not configured")
+        self._mark_local_valid(record)
+        self._publish_binding(record)
+        self._release_record_once(record, "transfer_succeeded")
+
+    def _release_record_once(self, record: RemoteG2BindingRecord, reason: str) -> bool:
+        lease_id = record.lease_id
+        if lease_id is None or lease_id in self._released_leases:
+            return False
+        self._released_leases.add(lease_id)
+        return self._release_lease(lease_id, reason)
+
+
+@dataclass
+class _RemoteG2ActiveLoad:
+    result: Any
+    started_at_ms: int
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
