@@ -43,10 +43,14 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         release_lease: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         super().__init__(llm_args)
-        self._plan_store = plan_store or target_remote_g2_plan_store()
+        self._plan_store = (
+            plan_store if plan_store is not None else target_remote_g2_plan_store()
+        )
         self._resolve_and_lease = resolve_and_lease
-        self._binding_store = binding_store or TargetRemoteG2BindingStore(
-            release_lease or _missing_release_lease
+        self._binding_store = (
+            binding_store
+            if binding_store is not None
+            else TargetRemoteG2BindingStore(release_lease or _missing_release_lease)
         )
 
     def get_num_new_matched_tokens(

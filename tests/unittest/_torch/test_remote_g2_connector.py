@@ -170,6 +170,22 @@ def test_remote_g2_connector_returns_zero_without_plan():
     )
 
 
+def test_remote_g2_connector_preserves_explicit_empty_plan_store():
+    plan_store = TargetRemotePlanStore(clock_ms=lambda: 500)
+    scheduler = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler(
+        None,
+        plan_store=plan_store,
+        resolve_and_lease=lambda plan: _resolve_result(),
+        release_lease=lambda lease_id, reason: True,
+    )
+    plan_store.put(1234, _plan())
+
+    assert scheduler.get_num_new_matched_tokens(SimpleNamespace(request_id=1234), 0) == (
+        48,
+        True,
+    )
+
+
 def test_remote_g2_connector_binds_after_allocated_block_ids():
     plan_store = TargetRemotePlanStore(clock_ms=lambda: 500)
     plan_store.put(1234, _plan())
