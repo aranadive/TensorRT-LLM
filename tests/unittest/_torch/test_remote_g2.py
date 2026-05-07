@@ -4,8 +4,10 @@
 import importlib.util
 import os
 import sys
+import types
 from pathlib import Path
 
+_CONNECTOR_PACKAGE = "tensorrt_llm._torch.pyexecutor.connectors"
 _REMOTE_G2_PATH = (
     Path(__file__).resolve().parents[3]
     / "tensorrt_llm"
@@ -14,11 +16,48 @@ _REMOTE_G2_PATH = (
     / "connectors"
     / "remote_g2.py"
 )
-_SPEC = importlib.util.spec_from_file_location("remote_g2_under_test", _REMOTE_G2_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_REMOTE_G2 = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _REMOTE_G2
-_SPEC.loader.exec_module(_REMOTE_G2)
+_REMOTE_G2_OBSERVABILITY_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_observability.py"
+)
+
+
+def _install_package(name):
+    module = sys.modules.get(name)
+    if module is None:
+        module = types.ModuleType(name)
+        module.__path__ = []
+        sys.modules[name] = module
+    return module
+
+
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_remote_g2_modules():
+    _install_package("tensorrt_llm")
+    _install_package("tensorrt_llm._torch")
+    _install_package("tensorrt_llm._torch.pyexecutor")
+    _install_package(_CONNECTOR_PACKAGE)
+    observability = _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_observability",
+        _REMOTE_G2_OBSERVABILITY_PATH,
+    )
+    remote_g2 = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2", _REMOTE_G2_PATH)
+    return observability, remote_g2
+
+
+OBSERVABILITY, _REMOTE_G2 = _load_remote_g2_modules()
 
 REMOTE_G2_REUSE_ENABLED_ENV = _REMOTE_G2.REMOTE_G2_REUSE_ENABLED_ENV
 REMOTE_KV_REUSE_PLAN_VERSION = _REMOTE_G2.REMOTE_KV_REUSE_PLAN_VERSION
@@ -31,6 +70,9 @@ SourceG2DescriptorRegistry = _REMOTE_G2.SourceG2DescriptorRegistry
 TargetRemoteG2BindingStore = _REMOTE_G2.TargetRemoteG2BindingStore
 TargetRemotePlanStore = _REMOTE_G2.TargetRemotePlanStore
 compute_remote_g2_matched_tokens = _REMOTE_G2.compute_remote_g2_matched_tokens
+InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
+RemoteG2LifecycleEvent = OBSERVABILITY.RemoteG2LifecycleEvent
+sanitize_remote_g2_event_details = OBSERVABILITY.sanitize_remote_g2_event_details
 
 
 def _plan(**overrides):
@@ -118,6 +160,68 @@ def test_target_store_respects_remote_g2_kill_switch():
             os.environ.pop(REMOTE_G2_REUSE_ENABLED_ENV, None)
         else:
             os.environ[REMOTE_G2_REUSE_ENABLED_ENV] = old_value
+
+
+def test_remote_g2_plan_store_emits_planned_event():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    store = TargetRemotePlanStore(clock_ms=lambda: 500, observability=sink)
+
+    stored = store.put(1234, _plan())
+
+    assert stored is not None
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.event == "planned"
+    assert event.outcome == "accepted"
+    assert event.reason == "ok"
+    assert event.request_id == 1234
+    assert event.plan_id == "plan-1"
+    assert event.source_worker_id == 7
+
+
+def test_remote_g2_observability_counts_are_low_cardinality():
+    sink = InMemoryRemoteG2ObservabilitySink()
+
+    # D-14/D-15/D-16: counters use only event, reason, tier, and outcome.
+    sink.emit(
+        RemoteG2LifecycleEvent(
+            event="planned",
+            reason="ok",
+            tier="host_pinned",
+            outcome="accepted",
+            request_id=1234,
+            plan_id="plan-1",
+            lease_id="lease-1",
+            source_worker_id=7,
+            source_generation=99,
+            token_count=32,
+            byte_count=8192,
+        )
+    )
+
+    assert sink.counts == {("planned", "ok", "host_pinned", "accepted"): 1}
+    assert sink.token_histogram == [32]
+    assert sink.byte_histogram == [8192]
+
+
+def test_remote_g2_observability_sanitizes_raw_transfer_details():
+    details = {
+        "ptr": 123,
+        "nixl_memory_desc": {"ptr": 456},
+        "descriptor": "raw",
+        "transfer_tuple": (1, 2, 3),
+        "request_id": 1234,
+        "safe_reason": "ok",
+    }
+
+    # D-17: raw memory, descriptor, and pointer-like details are not observable.
+    sanitized = sanitize_remote_g2_event_details(details)
+
+    assert "ptr" not in sanitized
+    assert "nixl_memory_desc" not in sanitized
+    assert "descriptor" not in sanitized
+    assert "transfer_tuple" not in sanitized
+    assert sanitized == {"request_id": 1234, "safe_reason": "ok"}
 
 
 def test_source_registry_resolve_and_lease_returns_live_contiguous_prefix():
@@ -266,6 +370,59 @@ def test_remote_g2_binding_uses_exact_allocated_target_block_slice():
     assert [block.source_descriptor.block_hash for block in bound.bound_blocks] == [22, 33]
     assert [block.source_block_index for block in bound.bound_blocks] == [1, 2]
     assert [block.target_block_index for block in bound.bound_blocks] == [1, 2]
+
+
+def test_remote_g2_binding_store_emits_resolved_truncated_and_fallback_events():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        observability=sink,
+    )
+
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(block_hashes=(11, 22), num_tokens=32),
+    )
+    fallback = store.resolve_for_request(
+        5678,
+        RemoteKvReusePlan.from_dict(_plan(plan_id="plan-fallback")),
+        7,
+        lambda plan: _resolve_result(lease_id="lease-fallback"),
+    )
+
+    assert record is not None
+    assert fallback is None
+    names = [event.event for event in sink.events]
+    assert "resolved" in names
+    assert "truncated" in names
+    assert "fallback" in names
+    assert ("lease-fallback", "unaligned_num_computed_tokens") in released
+
+
+def test_remote_g2_binding_store_release_events_are_exact_once():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        observability=sink,
+    )
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(lease_id="lease-release-events"),
+    )
+
+    assert store.release(1234, "transfer_failed") is True
+    assert store.release(1234, "transfer_failed") is False
+    assert record.release_attempted is True
+    assert released == [("lease-release-events", "transfer_failed")]
+    release_events = [event for event in sink.events if event.event == "released"]
+    assert release_events[0].outcome == "completed"
+    assert release_events[-1].outcome == "already_released"
 
 
 def test_remote_g2_binding_failure_releases_lease_once():

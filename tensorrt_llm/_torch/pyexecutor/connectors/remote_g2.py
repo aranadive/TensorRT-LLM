@@ -11,6 +11,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
+try:
+    from .remote_g2_observability import (
+        NullRemoteG2ObservabilitySink,
+        RemoteG2LifecycleEvent,
+        RemoteG2ObservabilitySink,
+    )
+except ImportError:
+    from remote_g2_observability import (  # type: ignore[no-redef]
+        NullRemoteG2ObservabilitySink,
+        RemoteG2LifecycleEvent,
+        RemoteG2ObservabilitySink,
+    )
+
 REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = "remote_kv_reuse_plan"
 REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_kv_reuse_no_plan_reason"
 REMOTE_KV_REUSE_PLAN_VERSION = 1
@@ -134,9 +147,11 @@ class TargetRemotePlanStore:
         *,
         enabled: bool = True,
         clock_ms: Callable[[], int] = _now_ms,
+        observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         self.enabled = enabled
         self._clock_ms = clock_ms
+        self._observability = observability or NullRemoteG2ObservabilitySink()
         self._plans: dict[int | str, TargetRemotePlanEntry] = {}
         self._lock = threading.RLock()
 
@@ -159,6 +174,19 @@ class TargetRemotePlanStore:
 
         with self._lock:
             self._plans[_normalize_request_id(trtllm_request_id)] = TargetRemotePlanEntry(parsed)
+        self._observability.emit(
+            RemoteG2LifecycleEvent(
+                event="planned",
+                reason="ok",
+                tier=parsed.source_tier,
+                outcome="accepted",
+                request_id=trtllm_request_id,
+                plan_id=parsed.plan_id,
+                source_worker_id=parsed.source_worker_id,
+                block_count=parsed.planned_prefix_blocks,
+                token_count=parsed.planned_prefix_blocks * parsed.block_size_tokens,
+            )
+        )
         return parsed
 
     def get(self, trtllm_request_id: int | str) -> Optional[RemoteKvReusePlan]:
@@ -350,8 +378,14 @@ def compute_remote_g2_matched_tokens(
 class TargetRemoteG2BindingStore:
     """Request-scoped target binding state for remote G2 reuse."""
 
-    def __init__(self, release_lease: Callable[[str, str], bool]) -> None:
+    def __init__(
+        self,
+        release_lease: Callable[[str, str], bool],
+        *,
+        observability: Optional[RemoteG2ObservabilitySink] = None,
+    ) -> None:
         self._release_lease = release_lease
+        self._observability = observability or NullRemoteG2ObservabilitySink()
         self._records: dict[int | str, RemoteG2BindingRecord] = {}
         self._lock = threading.RLock()
 
@@ -381,12 +415,35 @@ class TargetRemoteG2BindingStore:
         matched_tokens = compute_remote_g2_matched_tokens(
             result, num_computed_tokens, parsed.block_size_tokens
         )
+        planned_tokens = parsed.planned_prefix_blocks * parsed.block_size_tokens
         if matched_tokens == 0:
+            reason = self._zero_match_release_reason(
+                num_computed_tokens, parsed.block_size_tokens
+            )
+            if planned_tokens > 0:
+                self._emit_event(
+                    "truncated",
+                    parsed,
+                    result,
+                    request_id=key,
+                    reason=result.reason,
+                    outcome="reduced",
+                    token_count=0,
+                )
+            self._emit_event(
+                "fallback",
+                parsed,
+                result,
+                request_id=key,
+                reason=reason,
+                outcome="local_recompute",
+                token_count=0,
+            )
             self._release_positive_lease(
                 result,
-                self._zero_match_release_reason(
-                    num_computed_tokens, parsed.block_size_tokens
-                ),
+                reason,
+                parsed,
+                key,
             )
             return None
 
@@ -408,6 +465,27 @@ class TargetRemoteG2BindingStore:
                 )
                 return None if existing.is_terminal else existing
             self._records[key] = record
+        self._emit_event(
+            "resolved",
+            parsed,
+            result,
+            request_id=key,
+            reason=result.reason,
+            outcome="accepted",
+            token_count=matched_tokens,
+            block_count=matched_tokens // parsed.block_size_tokens,
+        )
+        if matched_tokens < planned_tokens or result.reason != "ok":
+            self._emit_event(
+                "truncated",
+                parsed,
+                result,
+                request_id=key,
+                reason=result.reason,
+                outcome="reduced",
+                token_count=matched_tokens,
+                block_count=matched_tokens // parsed.block_size_tokens,
+            )
         return record
 
     def bind_target_blocks(
@@ -436,6 +514,12 @@ class TargetRemoteG2BindingStore:
             source_descriptors = record.resolve_result.descriptors[start_block:end_block]
 
             if len(block_ids) < end_block or len(source_descriptors) != matched_blocks:
+                self._emit_record_event(
+                    "fallback",
+                    record,
+                    reason="target_binding_failed",
+                    outcome="local_recompute",
+                )
                 self._release_record_once(
                     record,
                     "target_binding_failed",
@@ -499,6 +583,9 @@ class TargetRemoteG2BindingStore:
         state: RemoteG2BindingState,
     ) -> bool:
         if record.release_attempted:
+            self._emit_record_event(
+                "released", record, reason=reason, outcome="already_released"
+            )
             return False
 
         record.release_attempted = True
@@ -506,16 +593,49 @@ class TargetRemoteG2BindingStore:
         record.state = state
         lease_id = record.lease_id
         if lease_id is None:
+            self._emit_record_event(
+                "released", record, reason=reason, outcome="no_lease"
+            )
             return False
 
         record.release_completed = self._release_lease(lease_id, reason)
+        self._emit_record_event(
+            "released",
+            record,
+            reason=reason,
+            outcome="completed" if record.release_completed else "already_released",
+        )
         return record.release_completed
 
     def _release_positive_lease(
-        self, result: RemoteG2ResolveResult, reason: str
+        self,
+        result: RemoteG2ResolveResult,
+        reason: str,
+        plan: Optional[RemoteKvReusePlan] = None,
+        request_id: Optional[int | str] = None,
     ) -> None:
         if result.lease_id is not None:
-            self._release_lease(result.lease_id, reason)
+            completed = self._release_lease(result.lease_id, reason)
+            self._observability.emit(
+                RemoteG2LifecycleEvent(
+                    event="released",
+                    reason=reason,
+                    tier=plan.source_tier if plan is not None else "g2",
+                    outcome="completed" if completed else "already_released",
+                    request_id=request_id,
+                    plan_id=plan.plan_id if plan is not None else None,
+                    lease_id=result.lease_id,
+                    source_worker_id=(
+                        plan.source_worker_id if plan is not None else None
+                    ),
+                    source_generation=result.source_generation,
+                    block_count=len(result.descriptors),
+                    byte_count=sum(
+                        descriptor.byte_length for descriptor in result.descriptors
+                    ),
+                    token_count=result.num_tokens,
+                )
+            )
 
     def _zero_match_release_reason(
         self, num_computed_tokens: int, block_size_tokens: int
@@ -534,6 +654,69 @@ class TargetRemoteG2BindingStore:
         if reason == "transfer_failed":
             return RemoteG2BindingState.TRANSFER_FAILED
         return RemoteG2BindingState.RELEASED
+
+    def _emit_event(
+        self,
+        event: str,
+        plan: RemoteKvReusePlan,
+        result: RemoteG2ResolveResult,
+        *,
+        request_id: int | str,
+        reason: str,
+        outcome: str,
+        token_count: int,
+        block_count: Optional[int] = None,
+    ) -> None:
+        count = len(result.descriptors) if block_count is None else block_count
+        self._observability.emit(
+            RemoteG2LifecycleEvent(
+                event=event,
+                reason=reason,
+                tier=plan.source_tier,
+                outcome=outcome,
+                request_id=request_id,
+                plan_id=plan.plan_id,
+                lease_id=result.lease_id,
+                source_worker_id=plan.source_worker_id,
+                source_generation=result.source_generation,
+                block_count=count,
+                byte_count=sum(
+                    descriptor.byte_length for descriptor in result.descriptors
+                ),
+                token_count=token_count,
+            )
+        )
+
+    def _emit_record_event(
+        self,
+        event: str,
+        record: RemoteG2BindingRecord,
+        *,
+        reason: str,
+        outcome: str,
+    ) -> None:
+        self._observability.emit(
+            RemoteG2LifecycleEvent(
+                event=event,
+                reason=reason,
+                tier=record.plan.source_tier,
+                outcome=outcome,
+                request_id=record.request_id,
+                plan_id=record.plan.plan_id,
+                lease_id=record.lease_id,
+                source_worker_id=record.plan.source_worker_id,
+                source_generation=record.source_generation,
+                block_count=len(record.bound_blocks) or len(record.resolve_result.descriptors),
+                byte_count=sum(
+                    block.source_descriptor.byte_length for block in record.bound_blocks
+                )
+                or sum(
+                    descriptor.byte_length
+                    for descriptor in record.resolve_result.descriptors
+                ),
+                token_count=record.matched_tokens,
+            )
+        )
 
 
 class SourceG2DescriptorRegistry:

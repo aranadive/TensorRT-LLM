@@ -30,6 +30,14 @@ _REMOTE_G2_TRANSFER_PATH = (
     / "connectors"
     / "remote_g2_transfer.py"
 )
+_REMOTE_G2_OBSERVABILITY_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_observability.py"
+)
 
 
 def _install_package(name):
@@ -78,6 +86,10 @@ def _load_connector_modules():
     kv_cache_connector.SchedulerOutput = object
     sys.modules[f"{_CONNECTOR_PACKAGE}.kv_cache_connector"] = kv_cache_connector
 
+    observability = _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_observability",
+        _REMOTE_G2_OBSERVABILITY_PATH,
+    )
     remote_g2 = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2", _REMOTE_G2_PATH)
     remote_g2_transfer = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
@@ -85,16 +97,19 @@ def _load_connector_modules():
     remote_g2_connector = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH
     )
-    return remote_g2, remote_g2_transfer, remote_g2_connector
+    return remote_g2, remote_g2_transfer, remote_g2_connector, observability
 
 
-REMOTE_G2, REMOTE_G2_TRANSFER, REMOTE_G2_CONNECTOR = _load_connector_modules()
+REMOTE_G2, REMOTE_G2_TRANSFER, REMOTE_G2_CONNECTOR, OBSERVABILITY = (
+    _load_connector_modules()
+)
 
 RemoteG2ConnectorMetadata = REMOTE_G2_CONNECTOR.RemoteG2ConnectorMetadata
 RemoteG2Descriptor = REMOTE_G2.RemoteG2Descriptor
 RemoteG2ResolveResult = REMOTE_G2.RemoteG2ResolveResult
 TargetRemotePlanStore = REMOTE_G2.TargetRemotePlanStore
 TargetRemoteG2BindingStore = REMOTE_G2.TargetRemoteG2BindingStore
+InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
 
 
 def _plan(**overrides):
@@ -173,6 +188,10 @@ def _bound_record(lease_id="lease-bound"):
     )
     store.bind_target_blocks(1234, [100, 101, 102])
     return record
+
+
+def _event_names(sink):
+    return [event.event for event in sink.events]
 
 
 def test_remote_g2_connector_resolves_before_reporting_tokens():
@@ -417,3 +436,87 @@ def test_remote_g2_worker_publishes_after_local_validity():
 
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert order == ["valid", "publish", "release:transfer_succeeded"]
+
+
+def test_remote_g2_worker_emits_transferred_and_released_on_success():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        observability=sink,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    names = _event_names(sink)
+    assert "transferred" in names
+    assert "released" in names
+    assert names.index("transferred") < names.index("released")
+
+
+def test_remote_g2_worker_emits_fallback_before_validity_or_publication():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    published = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=None,
+        publish_binding=published.append,
+        observability=sink,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        worker.get_finished([], [1234])
+    fallback = [event for event in sink.events if event.event == "fallback"]
+    assert fallback
+    assert fallback[0].outcome == "local_recompute"
+    assert published == []
+
+
+def test_remote_g2_worker_emits_failed_after_validity_is_marked():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: (_ for _ in ()).throw(
+            RuntimeError("publish failed")
+        ),
+        observability=sink,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        worker.get_finished([], [1234])
+    failed = [event for event in sink.events if event.event == "failed"]
+    assert failed
+    assert failed[0].outcome == "fail_closed"
+
+
+def test_remote_g2_worker_observability_never_logs_raw_descriptors():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        observability=sink,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+    worker.get_finished([], [1234])
+
+    forbidden = {"ptr", "nixl_memory_desc", "descriptor", "metadata", "transfer_tuple"}
+    for event in sink.events:
+        detail_text = " ".join(event.details)
+        assert not any(value in detail_text for value in forbidden)
