@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
 REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = "remote_kv_reuse_plan"
@@ -270,6 +271,269 @@ class RemoteG2ResolveResult:
     reason: str = "ok"
     source_generation: int = 0
     per_block_status: tuple[RemoteG2BlockStatus, ...] = ()
+
+
+class RemoteG2BindingState(str, Enum):
+    RESOLVED = "resolved"
+    BOUND = "bound"
+    BIND_FAILED = "bind_failed"
+    RELEASED = "released"
+    CANCELLED = "cancelled"
+    TRANSFER_FAILED = "transfer_failed"
+
+
+@dataclass(frozen=True)
+class RemoteG2BoundBlock:
+    source_descriptor: RemoteG2Descriptor
+    target_block_id: int
+    source_block_index: int
+    target_block_index: int
+
+
+@dataclass
+class RemoteG2BindingRecord:
+    request_id: int | str
+    plan: RemoteKvReusePlan
+    resolve_result: RemoteG2ResolveResult
+    matched_tokens: int
+    num_computed_tokens: int
+    block_size_tokens: int
+    state: RemoteG2BindingState = RemoteG2BindingState.RESOLVED
+    bound_blocks: tuple[RemoteG2BoundBlock, ...] = ()
+    release_attempted: bool = False
+    release_completed: bool = False
+    release_reason: Optional[str] = None
+
+    @property
+    def lease_id(self) -> Optional[str]:
+        return self.resolve_result.lease_id
+
+    @property
+    def source_generation(self) -> int:
+        return self.resolve_result.source_generation
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in {
+            RemoteG2BindingState.BIND_FAILED,
+            RemoteG2BindingState.RELEASED,
+            RemoteG2BindingState.CANCELLED,
+            RemoteG2BindingState.TRANSFER_FAILED,
+        }
+
+    @property
+    def is_transfer_ready(self) -> bool:
+        return self.state is RemoteG2BindingState.BOUND and bool(self.bound_blocks)
+
+
+def compute_remote_g2_matched_tokens(
+    result: RemoteG2ResolveResult,
+    num_computed_tokens: int,
+    block_size_tokens: int,
+) -> int:
+    if result.lease_id is None:
+        return 0
+    if block_size_tokens <= 0 or num_computed_tokens < 0:
+        return 0
+    if num_computed_tokens % block_size_tokens != 0:
+        return 0
+
+    resolved_tokens = min(
+        max(result.num_tokens, 0), len(result.descriptors) * block_size_tokens
+    )
+    resolved_blocks = resolved_tokens // block_size_tokens
+    computed_blocks = num_computed_tokens // block_size_tokens
+    matched_blocks = max(0, resolved_blocks - computed_blocks)
+    return matched_blocks * block_size_tokens
+
+
+class TargetRemoteG2BindingStore:
+    """Request-scoped target binding state for remote G2 reuse."""
+
+    def __init__(self, release_lease: Callable[[str, str], bool]) -> None:
+        self._release_lease = release_lease
+        self._records: dict[int | str, RemoteG2BindingRecord] = {}
+        self._lock = threading.RLock()
+
+    def resolve_for_request(
+        self,
+        request_id: int | str,
+        plan: Mapping[str, Any] | RemoteKvReusePlan,
+        num_computed_tokens: int,
+        resolve_and_lease: Callable[[RemoteKvReusePlan], RemoteG2ResolveResult],
+    ) -> Optional[RemoteG2BindingRecord]:
+        key = _normalize_request_id(request_id)
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None:
+                return None if existing.is_terminal else existing
+
+        try:
+            parsed = (
+                plan
+                if isinstance(plan, RemoteKvReusePlan)
+                else RemoteKvReusePlan.from_dict(plan)
+            )
+        except (TypeError, ValueError):
+            return None
+
+        result = resolve_and_lease(parsed)
+        matched_tokens = compute_remote_g2_matched_tokens(
+            result, num_computed_tokens, parsed.block_size_tokens
+        )
+        if matched_tokens == 0:
+            self._release_positive_lease(
+                result,
+                self._zero_match_release_reason(
+                    num_computed_tokens, parsed.block_size_tokens
+                ),
+            )
+            return None
+
+        record = RemoteG2BindingRecord(
+            request_id=key,
+            plan=parsed,
+            resolve_result=result,
+            matched_tokens=matched_tokens,
+            num_computed_tokens=num_computed_tokens,
+            block_size_tokens=parsed.block_size_tokens,
+        )
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None:
+                self._release_record_once(
+                    record,
+                    "duplicate_resolve",
+                    RemoteG2BindingState.RELEASED,
+                )
+                return None if existing.is_terminal else existing
+            self._records[key] = record
+        return record
+
+    def bind_target_blocks(
+        self, request_id: int | str, block_ids: list[int] | tuple[int, ...]
+    ) -> Optional[RemoteG2BindingRecord]:
+        key = _normalize_request_id(request_id)
+        with self._lock:
+            record = self._records.get(key)
+            if record is None:
+                return None
+            if record.state is RemoteG2BindingState.BOUND or record.is_terminal:
+                return record
+
+            block_size = record.block_size_tokens
+            if block_size <= 0 or record.num_computed_tokens % block_size != 0:
+                self._release_record_once(
+                    record,
+                    "target_binding_failed",
+                    RemoteG2BindingState.BIND_FAILED,
+                )
+                return record
+
+            start_block = record.num_computed_tokens // block_size
+            matched_blocks = record.matched_tokens // block_size
+            end_block = start_block + matched_blocks
+            source_descriptors = record.resolve_result.descriptors[start_block:end_block]
+
+            if len(block_ids) < end_block or len(source_descriptors) != matched_blocks:
+                self._release_record_once(
+                    record,
+                    "target_binding_failed",
+                    RemoteG2BindingState.BIND_FAILED,
+                )
+                return record
+
+            target_block_ids = block_ids[start_block:end_block]
+            record.bound_blocks = tuple(
+                RemoteG2BoundBlock(
+                    source_descriptor=descriptor,
+                    target_block_id=int(target_block_id),
+                    source_block_index=start_block + offset,
+                    target_block_index=start_block + offset,
+                )
+                for offset, (descriptor, target_block_id) in enumerate(
+                    zip(source_descriptors, target_block_ids)
+                )
+            )
+            record.state = RemoteG2BindingState.BOUND
+            return record
+
+    def release(self, request_id: int | str, reason: str = "released") -> bool:
+        with self._lock:
+            record = self._records.get(_normalize_request_id(request_id))
+            if record is None:
+                return False
+            return self._release_record_once(
+                record, reason, self._terminal_state_for_release(reason)
+            )
+
+    def discard(self, request_id: int | str, reason: str = "discarded") -> bool:
+        key = _normalize_request_id(request_id)
+        with self._lock:
+            record = self._records.pop(key, None)
+            if record is None:
+                return False
+            return self._release_record_once(
+                record, reason, self._terminal_state_for_release(reason)
+            )
+
+    def get(self, request_id: int | str) -> Optional[RemoteG2BindingRecord]:
+        with self._lock:
+            return self._records.get(_normalize_request_id(request_id))
+
+    def clear(self) -> None:
+        with self._lock:
+            records = tuple(self._records.values())
+            self._records.clear()
+        for record in records:
+            self._release_record_once(record, "clear", RemoteG2BindingState.RELEASED)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def _release_record_once(
+        self,
+        record: RemoteG2BindingRecord,
+        reason: str,
+        state: RemoteG2BindingState,
+    ) -> bool:
+        if record.release_attempted:
+            return False
+
+        record.release_attempted = True
+        record.release_reason = reason
+        record.state = state
+        lease_id = record.lease_id
+        if lease_id is None:
+            return False
+
+        record.release_completed = self._release_lease(lease_id, reason)
+        return record.release_completed
+
+    def _release_positive_lease(
+        self, result: RemoteG2ResolveResult, reason: str
+    ) -> None:
+        if result.lease_id is not None:
+            self._release_lease(result.lease_id, reason)
+
+    def _zero_match_release_reason(
+        self, num_computed_tokens: int, block_size_tokens: int
+    ) -> str:
+        if (
+            block_size_tokens > 0
+            and num_computed_tokens >= 0
+            and num_computed_tokens % block_size_tokens != 0
+        ):
+            return "unaligned_num_computed_tokens"
+        return "no_remote_g2_match"
+
+    def _terminal_state_for_release(self, reason: str) -> RemoteG2BindingState:
+        if reason in {"cancelled", "timeout", "disconnect"}:
+            return RemoteG2BindingState.CANCELLED
+        if reason == "transfer_failed":
+            return RemoteG2BindingState.TRANSFER_FAILED
+        return RemoteG2BindingState.RELEASED
 
 
 class SourceG2DescriptorRegistry:
