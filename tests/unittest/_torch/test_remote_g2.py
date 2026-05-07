@@ -23,9 +23,14 @@ _SPEC.loader.exec_module(_REMOTE_G2)
 REMOTE_G2_REUSE_ENABLED_ENV = _REMOTE_G2.REMOTE_G2_REUSE_ENABLED_ENV
 REMOTE_KV_REUSE_PLAN_VERSION = _REMOTE_G2.REMOTE_KV_REUSE_PLAN_VERSION
 RemoteKvReusePlan = _REMOTE_G2.RemoteKvReusePlan
+RemoteG2BindingState = _REMOTE_G2.RemoteG2BindingState
+RemoteG2Descriptor = _REMOTE_G2.RemoteG2Descriptor
+RemoteG2ResolveResult = _REMOTE_G2.RemoteG2ResolveResult
 SourceG2DescriptorRecord = _REMOTE_G2.SourceG2DescriptorRecord
 SourceG2DescriptorRegistry = _REMOTE_G2.SourceG2DescriptorRegistry
+TargetRemoteG2BindingStore = _REMOTE_G2.TargetRemoteG2BindingStore
 TargetRemotePlanStore = _REMOTE_G2.TargetRemotePlanStore
+compute_remote_g2_matched_tokens = _REMOTE_G2.compute_remote_g2_matched_tokens
 
 
 def _plan(**overrides):
@@ -58,6 +63,25 @@ def _record(block_hash, generation=1):
         pool_id="host-pool-0",
         byte_offset=block_hash * 4096,
         byte_length=4096,
+    )
+
+
+def _descriptor(block_hash, generation=1):
+    return RemoteG2Descriptor(
+        block_hash=block_hash,
+        descriptor_generation=generation,
+        pool_id="host-pool-0",
+        byte_offset=block_hash * 4096,
+        byte_length=4096,
+    )
+
+
+def _resolve_result(block_hashes=(11, 22, 33), num_tokens=48, lease_id="lease-1"):
+    return RemoteG2ResolveResult(
+        lease_id=lease_id,
+        descriptors=tuple(_descriptor(block_hash) for block_hash in block_hashes),
+        num_tokens=num_tokens,
+        source_generation=99,
     )
 
 
@@ -196,3 +220,135 @@ def test_remote_plan_parser_truncates_prefix_to_hash_count():
 
     assert parsed.planned_prefix_blocks == 3
     assert parsed.planned_hashes == (11, 22, 33)
+
+
+def test_remote_g2_matched_tokens_use_source_resolved_block_aligned_prefix():
+    result = _resolve_result(num_tokens=32)
+
+    assert compute_remote_g2_matched_tokens(result, 0, 16) == 32
+    assert compute_remote_g2_matched_tokens(result, 16, 16) == 16
+    assert compute_remote_g2_matched_tokens(result, 32, 16) == 0
+    assert compute_remote_g2_matched_tokens(_resolve_result(lease_id=None), 0, 16) == 0
+
+
+def test_remote_g2_matched_tokens_release_lease_for_unaligned_computed_boundary():
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True
+    )
+
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        7,
+        lambda plan: _resolve_result(lease_id="lease-unaligned"),
+    )
+
+    assert record is None
+    assert released == [("lease-unaligned", "unaligned_num_computed_tokens")]
+    assert len(store) == 0
+
+
+def test_remote_g2_binding_uses_exact_allocated_target_block_slice():
+    store = TargetRemoteG2BindingStore(release_lease=lambda lease_id, reason: True)
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        16,
+        lambda plan: _resolve_result(),
+    )
+
+    bound = store.bind_target_blocks(1234, [100, 101, 102])
+
+    assert bound is record
+    assert bound.state is RemoteG2BindingState.BOUND
+    assert [block.target_block_id for block in bound.bound_blocks] == [101, 102]
+    assert [block.source_descriptor.block_hash for block in bound.bound_blocks] == [22, 33]
+    assert [block.source_block_index for block in bound.bound_blocks] == [1, 2]
+    assert [block.target_block_index for block in bound.bound_blocks] == [1, 2]
+
+
+def test_remote_g2_binding_failure_releases_lease_once():
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True
+    )
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(lease_id="lease-bind-failed"),
+    )
+
+    first = store.bind_target_blocks(1234, [100, 101])
+    second = store.bind_target_blocks(1234, [100, 101])
+
+    assert first is record
+    assert second is record
+    assert record.state is RemoteG2BindingState.BIND_FAILED
+    assert record.release_attempted is True
+    assert released == [("lease-bind-failed", "target_binding_failed")]
+
+
+def test_remote_g2_duplicate_and_reordered_callbacks_are_idempotent():
+    released = []
+    resolve_calls = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True
+    )
+
+    assert store.bind_target_blocks(1234, [100, 101, 102]) is None
+    first = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: resolve_calls.append(plan.plan_id)
+        or _resolve_result(lease_id="lease-idempotent"),
+    )
+    duplicate = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: resolve_calls.append(plan.plan_id)
+        or _resolve_result(lease_id="lease-duplicate"),
+    )
+
+    assert duplicate is first
+    assert resolve_calls == ["plan-1"]
+    assert store.bind_target_blocks(1234, [100, 101, 102]) is first
+    assert store.bind_target_blocks(1234, [200, 201, 202]) is first
+    assert [block.target_block_id for block in first.bound_blocks] == [100, 101, 102]
+    assert store.release(1234, "transfer_failed") is True
+    assert store.release(1234, "transfer_failed") is False
+    assert first.state is RemoteG2BindingState.TRANSFER_FAILED
+    assert released == [("lease-idempotent", "transfer_failed")]
+
+
+def test_remote_g2_terminal_cleanup_releases_lease_once_for_all_reasons():
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True
+    )
+    cases = (
+        ("cancelled", RemoteG2BindingState.CANCELLED),
+        ("timeout", RemoteG2BindingState.CANCELLED),
+        ("disconnect", RemoteG2BindingState.CANCELLED),
+        ("transfer_failed", RemoteG2BindingState.TRANSFER_FAILED),
+        ("success", RemoteG2BindingState.RELEASED),
+    )
+
+    for index, (reason, expected_state) in enumerate(cases):
+        request_id = 2000 + index
+        lease_id = f"lease-{reason}"
+        record = store.resolve_for_request(
+            request_id,
+            RemoteKvReusePlan.from_dict(_plan(plan_id=f"plan-{index}")),
+            0,
+            lambda plan, lease_id=lease_id: _resolve_result(lease_id=lease_id),
+        )
+
+        assert store.release(request_id, reason) is True
+        assert store.release(request_id, reason) is False
+        assert record.state is expected_state
+
+    assert released == [(f"lease-{reason}", reason) for reason, _ in cases]
