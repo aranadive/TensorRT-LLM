@@ -107,6 +107,7 @@ class FakeAgent:
     def __init__(self):
         self.loaded = []
         self.registered = []
+        self.deregistered = []
         self.requests = []
 
     def load_remote_agent(self, name, agent_desc):
@@ -114,6 +115,9 @@ class FakeAgent:
 
     def register_memory(self, descs):
         self.registered.append(descs)
+
+    def deregister_memory(self, descs):
+        self.deregistered.append(descs)
 
     def submit_transfer_requests(self, request):
         self.requests.append(request)
@@ -242,6 +246,10 @@ def test_remote_g2_transfer_adapter_submits_one_read_for_bound_prefix():
     assert request.dst_descs.type == "VRAM"
     assert request.remote_name == "source-7"
     assert len(request.src_descs.descs) == len(record.bound_blocks)
+    result.release()
+    result.release()
+    assert result.released is True
+    assert agent.deregistered == [agent.registered[0]]
 
 
 def test_remote_g2_transfer_adapter_rejects_descriptor_count_mismatch():
