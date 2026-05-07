@@ -90,19 +90,28 @@ class RemoteG2TransferDescriptor:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class RemoteG2TransferResult:
     record: RemoteG2BindingRecord
     source_metadata: RemoteG2SourceMetadata
     source_descs: tuple[RemoteG2TransferDescriptor, ...]
     target_descs: tuple[RemoteG2TransferDescriptor, ...]
     status: Any
+    agent: Any
+    target_registration: Any
+    released: bool = False
 
     def is_completed(self) -> bool:
         return bool(self.status.is_completed())
 
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
         return bool(self.status.wait(timeout_ms))
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.agent.deregister_memory(self.target_registration)
+        self.released = True
 
 
 class RemoteG2SourceMetadataCache:
@@ -175,11 +184,10 @@ class RemoteG2NixlTransferAdapter:
         types = self._get_transfer_types()
         agent = self._get_agent(types)
         agent.load_remote_agent(source_metadata.remote_name, source_metadata.agent_desc)
-        agent.register_memory(
-            types.RegMemoryDescs(
-                "VRAM", [descriptor.registration_tuple() for descriptor in target_descs]
-            )
+        target_registration = types.RegMemoryDescs(
+            "VRAM", [descriptor.registration_tuple() for descriptor in target_descs]
         )
+        agent.register_memory(target_registration)
         request = types.TransferRequest(
             types.TransferOp.READ,
             types.MemoryDescs("DRAM", [descriptor.transfer_tuple() for descriptor in source_descs]),
@@ -193,6 +201,8 @@ class RemoteG2NixlTransferAdapter:
             source_descs=source_descs,
             target_descs=target_descs,
             status=status,
+            agent=agent,
+            target_registration=target_registration,
         )
 
     def _get_transfer_types(self) -> Any:

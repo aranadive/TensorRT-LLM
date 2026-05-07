@@ -140,11 +140,15 @@ class _FakeTransferResult:
         self.record = record
         self.completed = completed
         self.fail = fail
+        self.released = 0
 
     def is_completed(self):
         if self.fail:
             raise RuntimeError("transfer failed")
         return self.completed
+
+    def release(self):
+        self.released += 1
 
 
 class _FakeTransferAdapter:
@@ -334,17 +338,24 @@ def test_remote_g2_worker_reports_finished_only_after_transfer_success():
     worker.start_load_kv(None)
 
     assert worker.get_finished([], [1234]) == ([], [])
+    assert result.released == 0
     result.completed = True
     assert worker.get_finished([], [1234]) == ([], [1234])
+    assert result.released == 1
     assert released == [("lease-bound", "transfer_succeeded")]
 
 
 def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
     released = []
     published = []
-    adapter = _FakeTransferAdapter(
-        lambda record: _FakeTransferResult(record, completed=False, fail=True)
-    )
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=False, fail=True)
+        return result
+
+    adapter = _FakeTransferAdapter(make_result)
     worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=adapter,
@@ -359,8 +370,37 @@ def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
     with pytest.raises(RuntimeError, match="failed closed"):
         worker.get_finished([], [1234])
     assert worker.get_finished([], [1234]) == ([], [])
+    assert result.released == 1
     assert released == [("lease-bound", "transfer_failed")]
     assert published == []
+
+
+def test_remote_g2_worker_timeout_releases_transfer_and_lease_once():
+    released = []
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=False)
+        return result
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        transfer_timeout_ms=-1,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        worker.get_finished([], [1234])
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert result.released == 1
+    assert released == [("lease-bound", "transfer_timeout")]
 
 
 def test_remote_g2_worker_publishes_after_local_validity():

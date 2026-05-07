@@ -164,17 +164,26 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             record = active.result.record
             try:
                 if active.result.is_completed():
+                    self._release_transfer_result_once(active.result)
                     self._complete_success(record)
                     self._active_loads.pop(request_id, None)
                     self._completed_loads.add(request_id)
                     finished_loading.append(int(request_id))
                 elif _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
                     self._active_loads.pop(request_id, None)
-                    self._release_record_once(record, "transfer_timeout")
-                    raise RuntimeError("remote G2 transfer timed out")
+                    try:
+                        self._release_transfer_result_once(active.result)
+                    finally:
+                        self._release_record_once(record, "transfer_timeout")
+                    raise TimeoutError("remote G2 transfer timed out")
+            except TimeoutError as exc:
+                raise RuntimeError("remote G2 transfer timed out") from exc
             except Exception as exc:
                 self._active_loads.pop(request_id, None)
-                self._release_record_once(record, "transfer_failed")
+                try:
+                    self._release_transfer_result_once(active.result)
+                finally:
+                    self._release_record_once(record, "transfer_failed")
                 raise RuntimeError("remote G2 transfer failed closed") from exc
         return ([], finished_loading)
 
@@ -195,6 +204,11 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             return False
         self._released_leases.add(lease_id)
         return self._release_lease(lease_id, reason)
+
+    def _release_transfer_result_once(self, result: Any) -> None:
+        release = getattr(result, "release", None)
+        if release is not None:
+            release()
 
 
 @dataclass
