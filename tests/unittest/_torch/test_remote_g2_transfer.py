@@ -23,6 +23,14 @@ _REMOTE_G2_TRANSFER_PATH = (
     / "connectors"
     / "remote_g2_transfer.py"
 )
+_REMOTE_G2_OBSERVABILITY_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_observability.py"
+)
 
 
 def _install_package(name):
@@ -48,6 +56,10 @@ def _load_transfer_modules():
     _install_package("tensorrt_llm._torch")
     _install_package("tensorrt_llm._torch.pyexecutor")
     _install_package(_CONNECTOR_PACKAGE)
+    _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_observability",
+        _REMOTE_G2_OBSERVABILITY_PATH,
+    )
     remote_g2 = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2", _REMOTE_G2_PATH)
     transfer = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
