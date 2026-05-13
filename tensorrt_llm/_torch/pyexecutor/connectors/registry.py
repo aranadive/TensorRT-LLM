@@ -35,4 +35,10 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_scheduler_class": "DynamoKVBMConnectorLeader",
         "connector_worker_class": "DynamoKVBMConnectorWorker",
     },
+    "remote_g2": {
+        "connector_module":
+            "tensorrt_llm._torch.pyexecutor.connectors.remote_g2_connector",
+        "connector_scheduler_class": "RemoteG2KvCacheConnectorScheduler",
+        "connector_worker_class": "RemoteG2KvCacheConnectorWorker",
+    },
 }
