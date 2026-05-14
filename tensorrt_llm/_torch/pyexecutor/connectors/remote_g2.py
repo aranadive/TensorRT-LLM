@@ -68,6 +68,7 @@ class RemoteKvReusePlan:
     source_dp_rank: int
     source_tier: str
     block_hashes: tuple[int, ...]
+    start_block_index: int
     planned_prefix_blocks: int
     block_size_tokens: int
     created_at_ms: int
@@ -86,6 +87,7 @@ class RemoteKvReusePlan:
                 "source_worker_id",
                 "source_dp_rank",
                 "source_tier",
+                "start_block_index",
                 "block_hashes",
                 "planned_prefix_blocks",
                 "block_size_tokens",
@@ -101,6 +103,9 @@ class RemoteKvReusePlan:
         planned_prefix_blocks = int(data["planned_prefix_blocks"])
         if planned_prefix_blocks < 0:
             raise ValueError("planned_prefix_blocks must be non-negative")
+        start_block_index = int(data["start_block_index"])
+        if start_block_index < 0:
+            raise ValueError("start_block_index must be non-negative")
 
         return cls(
             plan_id=str(data["plan_id"]),
@@ -111,6 +116,7 @@ class RemoteKvReusePlan:
             source_dp_rank=int(data["source_dp_rank"]),
             source_tier=str(data["source_tier"]),
             block_hashes=block_hashes,
+            start_block_index=start_block_index,
             planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
             block_size_tokens=int(data["block_size_tokens"]),
             created_at_ms=int(data["created_at_ms"]),
@@ -355,6 +361,7 @@ class RemoteG2BindingRecord:
 
 
 def compute_remote_g2_matched_tokens(
+    plan: RemoteKvReusePlan,
     result: RemoteG2ResolveResult,
     num_computed_tokens: int,
     block_size_tokens: int,
@@ -366,12 +373,23 @@ def compute_remote_g2_matched_tokens(
     if num_computed_tokens % block_size_tokens != 0:
         return 0
 
+    computed_blocks = num_computed_tokens // block_size_tokens
+    # B's prefix ends before the plan begins → gap. Attaching would put the
+    # plan's blocks at the wrong target positions (silent KV corruption).
+    if computed_blocks < plan.start_block_index:
+        return 0
+
     resolved_tokens = min(
         max(result.num_tokens, 0), len(result.descriptors) * block_size_tokens
     )
     resolved_blocks = resolved_tokens // block_size_tokens
-    computed_blocks = num_computed_tokens // block_size_tokens
-    matched_blocks = max(0, resolved_blocks - computed_blocks)
+    plan_end = plan.start_block_index + resolved_blocks
+    # B already has every position the plan covers → nothing to transfer.
+    if computed_blocks >= plan_end:
+        return 0
+
+    skip = computed_blocks - plan.start_block_index
+    matched_blocks = resolved_blocks - skip
     return matched_blocks * block_size_tokens
 
 
@@ -413,7 +431,7 @@ class TargetRemoteG2BindingStore:
 
         result = resolve_and_lease(parsed)
         matched_tokens = compute_remote_g2_matched_tokens(
-            result, num_computed_tokens, parsed.block_size_tokens
+            parsed, result, num_computed_tokens, parsed.block_size_tokens
         )
         planned_tokens = parsed.planned_prefix_blocks * parsed.block_size_tokens
         if matched_tokens == 0:
@@ -508,12 +526,23 @@ class TargetRemoteG2BindingStore:
                 )
                 return record
 
-            start_block = record.num_computed_tokens // block_size
+            plan_start = record.plan.start_block_index
+            computed_blocks = record.num_computed_tokens // block_size
             matched_blocks = record.matched_tokens // block_size
-            end_block = start_block + matched_blocks
-            source_descriptors = record.resolve_result.descriptors[start_block:end_block]
+            # `skip` is how many of the plan's blocks B already has on Device;
+            # those descriptors are dropped from the front of the transfer.
+            # compute_remote_g2_matched_tokens guarantees skip >= 0 and
+            # skip + matched_blocks <= len(descriptors).
+            skip = computed_blocks - plan_start
+            source_end = skip + matched_blocks
+            source_descriptors = record.resolve_result.descriptors[skip:source_end]
+            target_end = computed_blocks + matched_blocks
 
-            if len(block_ids) < end_block or len(source_descriptors) != matched_blocks:
+            if (
+                skip < 0
+                or len(block_ids) < target_end
+                or len(source_descriptors) != matched_blocks
+            ):
                 self._emit_record_event(
                     "fallback",
                     record,
@@ -527,13 +556,13 @@ class TargetRemoteG2BindingStore:
                 )
                 return record
 
-            target_block_ids = block_ids[start_block:end_block]
+            target_block_ids = block_ids[computed_blocks:target_end]
             record.bound_blocks = tuple(
                 RemoteG2BoundBlock(
                     source_descriptor=descriptor,
                     target_block_id=int(target_block_id),
-                    source_block_index=start_block + offset,
-                    target_block_index=start_block + offset,
+                    source_block_index=plan_start + skip + offset,
+                    target_block_index=computed_blocks + offset,
                 )
                 for offset, (descriptor, target_block_id) in enumerate(
                     zip(source_descriptors, target_block_ids)

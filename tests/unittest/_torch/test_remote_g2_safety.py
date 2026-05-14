@@ -219,6 +219,7 @@ def _plan(**overrides):
         "source_dp_rank": 0,
         "source_tier": "host_pinned",
         "block_hashes": [11, 22, 33],
+        "start_block_index": 0,
         "planned_prefix_blocks": 3,
         "block_size_tokens": 16,
         "created_at_ms": 100,
@@ -327,7 +328,7 @@ def test_remote_g2_decision_equivalence_for_representative_prefixes():
 
         # D-06/D-07/D-08/D-09: local validation asserts decision equivalence.
         assert (
-            compute_remote_g2_matched_tokens(result, computed, 16) == expected
+            compute_remote_g2_matched_tokens(RemoteKvReusePlan.from_dict(_plan(plan_id=f"plan-{name}")), result, computed, 16) == expected
         ), name
         record = store.resolve_for_request(
             1000 + index,
@@ -347,6 +348,58 @@ def test_remote_g2_decision_equivalence_for_representative_prefixes():
     assert "truncated" in names
     assert "fallback" in names
     assert "released" in names
+
+
+def test_compute_matched_returns_zero_when_b_prefix_short_of_plan_start():
+    # Scenario: source A has request blocks 0..4 (Device 0-3, HostPinned 4).
+    # Planner emits plan covering position 4 only (start_block_index=4).
+    # Target B has 0 computed tokens — its prefix ends before the plan starts.
+    # Attaching the plan's block 4 at B's position 0 would corrupt the cache,
+    # so the function must return 0 and let B recompute locally.
+    plan = RemoteKvReusePlan.from_dict(
+        _plan(
+            plan_id="gap",
+            block_hashes=[44],
+            start_block_index=4,
+            planned_prefix_blocks=1,
+        )
+    )
+    result = _resolve_result(block_hashes=(44,), num_tokens=16, lease_id="lease-gap")
+    assert compute_remote_g2_matched_tokens(plan, result, 0, 16) == 0
+
+
+def test_compute_matched_handles_partial_overlap_with_target_prefix():
+    # Plan covers request positions [4, 7) (3 blocks). Target B has positions
+    # 0..4 cached on Device (computed_blocks = 5). B already has the plan's
+    # first block; the remaining two are net-new. Expect 2 * block_size matched.
+    plan = RemoteKvReusePlan.from_dict(
+        _plan(
+            plan_id="overlap",
+            block_hashes=[44, 55, 66],
+            start_block_index=4,
+            planned_prefix_blocks=3,
+        )
+    )
+    result = _resolve_result(
+        block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-overlap"
+    )
+    assert compute_remote_g2_matched_tokens(plan, result, 5 * 16, 16) == 2 * 16
+
+
+def test_compute_matched_returns_zero_when_b_prefix_past_plan_end():
+    # Plan covers [4, 7); B has 8 blocks cached already → plan is redundant.
+    plan = RemoteKvReusePlan.from_dict(
+        _plan(
+            plan_id="past",
+            block_hashes=[44, 55, 66],
+            start_block_index=4,
+            planned_prefix_blocks=3,
+        )
+    )
+    result = _resolve_result(
+        block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-past"
+    )
+    assert compute_remote_g2_matched_tokens(plan, result, 8 * 16, 16) == 0
 
 
 def test_remote_g2_fault_injection_covers_roadmap_failure_set():
