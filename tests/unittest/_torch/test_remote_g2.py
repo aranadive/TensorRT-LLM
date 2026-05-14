@@ -85,6 +85,7 @@ def _plan(**overrides):
         "source_dp_rank": 0,
         "source_tier": "host_pinned",
         "block_hashes": [11, 22, 33],
+        "start_block_index": 0,
         "planned_prefix_blocks": 3,
         "block_size_tokens": 16,
         "created_at_ms": 100,
@@ -328,11 +329,12 @@ def test_remote_plan_parser_truncates_prefix_to_hash_count():
 
 def test_remote_g2_matched_tokens_use_source_resolved_block_aligned_prefix():
     result = _resolve_result(num_tokens=32)
+    plan = RemoteKvReusePlan.from_dict(_plan())
 
-    assert compute_remote_g2_matched_tokens(result, 0, 16) == 32
-    assert compute_remote_g2_matched_tokens(result, 16, 16) == 16
-    assert compute_remote_g2_matched_tokens(result, 32, 16) == 0
-    assert compute_remote_g2_matched_tokens(_resolve_result(lease_id=None), 0, 16) == 0
+    assert compute_remote_g2_matched_tokens(plan, result, 0, 16) == 32
+    assert compute_remote_g2_matched_tokens(plan, result, 16, 16) == 16
+    assert compute_remote_g2_matched_tokens(plan, result, 32, 16) == 0
+    assert compute_remote_g2_matched_tokens(plan, _resolve_result(lease_id=None), 0, 16) == 0
 
 
 def test_remote_g2_matched_tokens_release_lease_for_unaligned_computed_boundary():
