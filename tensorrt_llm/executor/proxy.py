@@ -13,6 +13,7 @@ import zmq
 import zmq.asyncio
 
 import logging as _logging
+import os as _os
 
 from tensorrt_llm._torch.pyexecutor.connectors.remote_g2 import (
     target_remote_g2_plan_store,
@@ -512,25 +513,27 @@ class GenerationExecutorProxy(GenerationExecutor):
         try:
             if remote_g2_plan is not None:
                 _remote_g2_logger.info(
-                    "[Proxy] remote_g2_plan received for request=%s plan_id=%s "
-                    "source_worker=%s tier=%s planned_blocks=%s",
+                    "[KVP2P-TRACE][PROXY] plan_received: request_id=%s plan_id=%s "
+                    "source_worker=%s tier=%s planned_blocks=%s pid=%s",
                     request.id,
                     remote_g2_plan.get("plan_id", "?"),
                     remote_g2_plan.get("source_worker_id", "?"),
                     remote_g2_plan.get("source_tier", "?"),
                     remote_g2_plan.get("planned_prefix_blocks", "?"),
+                    _os.getpid(),
                 )
                 remote_g2_plan_registered = (
                     target_remote_g2_plan_store().put(request.id, remote_g2_plan)
                     is not None
                 )
                 _remote_g2_logger.info(
-                    "[Proxy] plan store registration: request=%s registered=%s",
-                    request.id, remote_g2_plan_registered,
+                    "[KVP2P-TRACE][PROXY] plan_registered: request_id=%s registered=%s pid=%s",
+                    request.id, remote_g2_plan_registered, _os.getpid(),
                 )
             else:
-                _remote_g2_logger.debug(
-                    "[Proxy] no remote_g2_plan for request=%s", request.id,
+                _remote_g2_logger.info(
+                    "[KVP2P-TRACE][PROXY] no_plan: request_id=%s pid=%s",
+                    request.id, _os.getpid(),
                 )
 
             with nvtx_range_debug("request_queue.put"):

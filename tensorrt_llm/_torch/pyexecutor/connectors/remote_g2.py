@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
+import logging as _logging
+
+_kvp2p_logger = _logging.getLogger("tensorrt_llm.remote_g2")
+
 try:
     from .remote_g2_observability import (
         NullRemoteG2ObservabilitySink,
@@ -165,6 +169,12 @@ class TargetRemotePlanStore:
         self, trtllm_request_id: int | str, plan: Mapping[str, Any] | RemoteKvReusePlan
     ) -> Optional[RemoteKvReusePlan]:
         if not self.enabled or not remote_g2_reuse_enabled():
+            _kvp2p_logger.info(
+                "[KVP2P-TRACE][PLAN_STORE] put_skipped: request_id=%s "
+                "enabled=%s reuse_enabled=%s pid=%s store_id=%s",
+                trtllm_request_id, self.enabled, remote_g2_reuse_enabled(),
+                os.getpid(), id(self),
+            )
             return None
         try:
             parsed = (
@@ -172,14 +182,31 @@ class TargetRemotePlanStore:
                 if isinstance(plan, RemoteKvReusePlan)
                 else RemoteKvReusePlan.from_dict(plan)
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            _kvp2p_logger.warning(
+                "[KVP2P-TRACE][PLAN_STORE] put_parse_failed: request_id=%s "
+                "error=%s pid=%s store_id=%s",
+                trtllm_request_id, exc, os.getpid(), id(self),
+            )
             return None
         now_ms = self._clock_ms()
         if not parsed.is_remote_g2() or parsed.is_expired(now_ms):
+            _kvp2p_logger.info(
+                "[KVP2P-TRACE][PLAN_STORE] put_rejected: request_id=%s "
+                "is_g2=%s is_expired=%s tier=%s pid=%s",
+                trtllm_request_id, parsed.is_remote_g2(),
+                parsed.is_expired(now_ms), parsed.source_tier, os.getpid(),
+            )
             return None
 
         with self._lock:
             self._plans[_normalize_request_id(trtllm_request_id)] = TargetRemotePlanEntry(parsed)
+        _kvp2p_logger.info(
+            "[KVP2P-TRACE][PLAN_STORE] put_ok: request_id=%s plan_id=%s "
+            "source_worker=%s planned_blocks=%s plans_count=%s pid=%s store_id=%s",
+            trtllm_request_id, parsed.plan_id, parsed.source_worker_id,
+            parsed.planned_prefix_blocks, len(self._plans), os.getpid(), id(self),
+        )
         self._observability.emit(
             RemoteG2LifecycleEvent(
                 event="planned",
@@ -200,10 +227,26 @@ class TargetRemotePlanStore:
         with self._lock:
             entry = self._plans.get(key)
             if entry is None:
+                _kvp2p_logger.info(
+                    "[KVP2P-TRACE][PLAN_STORE] get_miss: request_id=%s "
+                    "plans_count=%s pid=%s store_id=%s",
+                    trtllm_request_id, len(self._plans), os.getpid(), id(self),
+                )
                 return None
             if entry.plan.is_expired(self._clock_ms()):
                 self._plans.pop(key, None)
+                _kvp2p_logger.info(
+                    "[KVP2P-TRACE][PLAN_STORE] get_expired: request_id=%s "
+                    "plan_id=%s pid=%s store_id=%s",
+                    trtllm_request_id, entry.plan.plan_id, os.getpid(), id(self),
+                )
                 return None
+            _kvp2p_logger.info(
+                "[KVP2P-TRACE][PLAN_STORE] get_hit: request_id=%s plan_id=%s "
+                "source_worker=%s pid=%s store_id=%s",
+                trtllm_request_id, entry.plan.plan_id,
+                entry.plan.source_worker_id, os.getpid(), id(self),
+            )
             return entry.plan
 
     def bind_resolution(

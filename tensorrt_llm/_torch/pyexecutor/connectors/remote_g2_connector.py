@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -68,12 +69,13 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
             )
         )
         logger.info(
-            "[RemoteG2Scheduler] initialized — resolve_and_lease=%s, "
-            "release_lease=%s, plan_store=%s, binding_store=%s",
+            "[KVP2P-TRACE][SCHEDULER] init: resolve_and_lease=%s "
+            "release_lease=%s plan_store=%s binding_store=%s pid=%s",
             "WIRED" if resolve_and_lease is not None else "NONE (plans will be ignored)",
             "WIRED" if release_lease is not None else "NONE (using default no-op)",
             type(self._plan_store).__name__,
             type(self._binding_store).__name__,
+            os.getpid(),
         )
 
     def get_num_new_matched_tokens(
@@ -82,23 +84,27 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         plan = self._plan_store.get(request.request_id)
         if plan is None or self._resolve_and_lease is None:
             if plan is None:
-                logger.debug(
-                    "[RemoteG2Scheduler] get_num_new_matched_tokens: no plan for request=%s",
+                logger.info(
+                    "[KVP2P-TRACE][SCHEDULER] get_num_matched: request_id=%s "
+                    "plan_found=False resolve_and_lease=%s pid=%s",
                     request.request_id,
+                    "WIRED" if self._resolve_and_lease else "NONE",
+                    os.getpid(),
                 )
             else:
                 logger.warning(
-                    "[RemoteG2Scheduler] get_num_new_matched_tokens: plan found for request=%s "
-                    "but resolve_and_lease is NONE — cannot resolve",
-                    request.request_id,
+                    "[KVP2P-TRACE][SCHEDULER] get_num_matched: request_id=%s "
+                    "plan_found=True resolve_and_lease=NONE — cannot resolve pid=%s",
+                    request.request_id, os.getpid(),
                 )
             return (0, False)
 
         logger.info(
-            "[RemoteG2Scheduler] resolving plan for request=%s plan_id=%s "
-            "source_worker=%s tier=%s planned_blocks=%d computed_tokens=%d",
+            "[KVP2P-TRACE][SCHEDULER] resolving: request_id=%s plan_id=%s "
+            "source_worker=%s tier=%s planned_blocks=%d computed_tokens=%d pid=%s",
             request.request_id, plan.plan_id, plan.source_worker_id,
             plan.source_tier, plan.planned_prefix_blocks, num_computed_tokens,
+            os.getpid(),
         )
         record = self._binding_store.resolve_for_request(
             request.request_id,
@@ -108,12 +114,12 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         )
         if record is None:
             logger.info(
-                "[RemoteG2Scheduler] resolve returned no record for request=%s — fallback to local",
+                "[KVP2P-TRACE][SCHEDULER] resolve_failed: request_id=%s — fallback to local",
                 request.request_id,
             )
             return (0, False)
         logger.info(
-            "[RemoteG2Scheduler] resolved request=%s matched_tokens=%d lease_id=%s",
+            "[KVP2P-TRACE][SCHEDULER] resolved: request_id=%s matched_tokens=%d lease_id=%s",
             request.request_id, record.matched_tokens, record.lease_id,
         )
         return (record.matched_tokens, True)
@@ -137,11 +143,11 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
             if record is not None and record.is_transfer_ready:
                 bindings.append(record)
         meta = RemoteG2ConnectorMetadata(tuple(bindings))
-        if bindings:
-            logger.info(
-                "[RemoteG2Scheduler] build_connector_meta: %d transfer-ready bindings queued",
-                len(bindings),
-            )
+        logger.info(
+            "[KVP2P-TRACE][SCHEDULER] build_meta: total_requests=%d "
+            "transfer_ready_bindings=%d",
+            len(seen_request_ids), len(bindings),
+        )
         return meta
 
     def request_finished(self, request: Any, cache_block_ids: list[int]) -> bool:
@@ -173,22 +179,31 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
         logger.info(
-            "[RemoteG2Worker] initialized — transfer_adapter=%s, "
-            "release_lease=%s, mark_local_valid=%s, publish_binding=%s, timeout_ms=%d",
+            "[KVP2P-TRACE][WORKER] init: transfer_adapter=%s "
+            "release_lease=%s mark_local_valid=%s publish_binding=%s "
+            "timeout_ms=%d pid=%s",
             type(transfer_adapter).__name__ if transfer_adapter is not None else "NONE",
             "WIRED" if release_lease is not None else "NONE",
             "WIRED" if mark_local_valid is not None else "NONE",
             "WIRED" if publish_binding is not None else "NONE",
-            transfer_timeout_ms,
+            transfer_timeout_ms, os.getpid(),
         )
 
     def register_kv_caches(self, kv_cache_tensor: Any) -> None:
         self._kv_cache_tensor = kv_cache_tensor
-        logger.info("[RemoteG2Worker] register_kv_caches called — KV tensors registered")
+        logger.info("[KVP2P-TRACE][WORKER] register_kv_caches: KV tensors registered pid=%s", os.getpid())
 
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
         if not isinstance(metadata, RemoteG2ConnectorMetadata) or not metadata.bindings:
+            logger.info(
+                "[KVP2P-TRACE][WORKER] start_load_kv: no_bindings "
+                "has_meta=%s binding_count=%s transfer_adapter=%s pid=%s",
+                isinstance(metadata, RemoteG2ConnectorMetadata),
+                len(metadata.bindings) if isinstance(metadata, RemoteG2ConnectorMetadata) else 0,
+                type(self._transfer_adapter).__name__ if self._transfer_adapter else "NONE",
+                os.getpid(),
+            )
             return
         if self._transfer_adapter is None:
             for record in metadata.bindings:
@@ -206,15 +221,15 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             if request_id in self._active_loads or request_id in self._completed_loads:
                 continue
             logger.info(
-                "[RemoteG2Worker] start_transfer: request=%s plan_id=%s "
-                "source_worker=%s blocks=%d lease_id=%s",
+                "[KVP2P-TRACE][WORKER] start_transfer: request_id=%s plan_id=%s "
+                "source_worker=%s blocks=%d lease_id=%s pid=%s",
                 request_id, record.plan.plan_id, record.plan.source_worker_id,
-                len(record.bound_blocks), record.lease_id,
+                len(record.bound_blocks), record.lease_id, os.getpid(),
             )
             try:
                 result = self._transfer_adapter.start_transfer(record)
                 logger.info(
-                    "[RemoteG2Worker] transfer submitted: request=%s — NIXL READ in flight",
+                    "[KVP2P-TRACE][WORKER] transfer_submitted: request_id=%s NIXL_READ_in_flight",
                     request_id,
                 )
             except Exception as exc:
@@ -266,7 +281,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
 
             if completed:
                 logger.info(
-                    "[RemoteG2Worker] transfer COMPLETED: request=%s plan_id=%s "
+                    "[KVP2P-TRACE][WORKER] transfer_completed: request_id=%s plan_id=%s "
                     "blocks=%d tokens=%d elapsed_ms=%d",
                     request_id, record.plan.plan_id, len(record.bound_blocks),
                     record.matched_tokens, _now_ms() - active.started_at_ms,

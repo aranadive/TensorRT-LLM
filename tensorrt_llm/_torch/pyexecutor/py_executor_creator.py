@@ -765,11 +765,12 @@ def create_py_executor(
             import logging as _logging
             _remote_g2_log = _logging.getLogger("tensorrt_llm.remote_g2")
             _remote_g2_log.info(
-                "[PyExecutorCreator] loading KV connector: module=%s "
-                "scheduler_cls=%s worker_cls=%s",
+                "[KVP2P-TRACE][CREATOR] loading_connector: module=%s "
+                "scheduler_cls=%s worker_cls=%s pid=%s",
                 kv_connector_config.connector_module,
                 kv_connector_config.connector_scheduler_class,
                 kv_connector_config.connector_worker_class,
+                os.getpid(),
             )
 
             module = importlib.import_module(
@@ -780,11 +781,16 @@ def create_py_executor(
                 module, kv_connector_config.connector_scheduler_class)
 
             _remote_g2_log.info(
-                "[PyExecutorCreator] connector classes loaded: worker=%s scheduler=%s",
-                worker_cls, scheduler_cls,
+                "[KVP2P-TRACE][CREATOR] classes_loaded: worker=%s scheduler=%s pid=%s",
+                worker_cls, scheduler_cls, os.getpid(),
             )
 
             rank = tensorrt_llm.mpi_rank()
+            _remote_g2_log.info(
+                "[KVP2P-TRACE][CREATOR] instantiating: rank=%s "
+                "scheduler_on_this_rank=%s pid=%s",
+                rank, scheduler_cls is not None and rank == 0, os.getpid(),
+            )
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.

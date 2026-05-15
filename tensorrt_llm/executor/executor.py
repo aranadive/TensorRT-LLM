@@ -168,6 +168,22 @@ class GenerationExecutor(ABC):
             priority=priority)
         if remote_g2_plan is not None:
             request.remote_g2_plan = remote_g2_plan
+            logger.info(
+                "[KVP2P-TRACE][EXECUTOR] plan_on_request: "
+                "plan_id=%s source_worker=%s planned_blocks=%s "
+                "prompt_len=%d pid=%s",
+                remote_g2_plan.get("plan_id"),
+                remote_g2_plan.get("source_worker_id"),
+                remote_g2_plan.get("planned_prefix_blocks"),
+                len(prompt_token_ids),
+                __import__("os").getpid(),
+            )
+        else:
+            logger.info(
+                "[KVP2P-TRACE][EXECUTOR] no_plan: prompt_len=%d pid=%s",
+                len(prompt_token_ids),
+                __import__("os").getpid(),
+            )
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
