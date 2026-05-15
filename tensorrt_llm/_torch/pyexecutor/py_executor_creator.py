@@ -762,12 +762,27 @@ def create_py_executor(
             )
 
         try:
+            import logging as _logging
+            _remote_g2_log = _logging.getLogger("tensorrt_llm.remote_g2")
+            _remote_g2_log.info(
+                "[PyExecutorCreator] loading KV connector: module=%s "
+                "scheduler_cls=%s worker_cls=%s",
+                kv_connector_config.connector_module,
+                kv_connector_config.connector_scheduler_class,
+                kv_connector_config.connector_worker_class,
+            )
+
             module = importlib.import_module(
                 kv_connector_config.connector_module)
             worker_cls = getattr(module,
                                  kv_connector_config.connector_worker_class)
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
+
+            _remote_g2_log.info(
+                "[PyExecutorCreator] connector classes loaded: worker=%s scheduler=%s",
+                worker_cls, scheduler_cls,
+            )
 
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.

@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence
+
+logger = logging.getLogger("tensorrt_llm.remote_g2")
 
 from .remote_g2 import RemoteG2BindingRecord, RemoteG2Descriptor
 
@@ -161,11 +164,21 @@ class RemoteG2NixlTransferAdapter:
         self._transfer_types = transfer_types
         self._agent_name = agent_name
         self._agent: Optional[Any] = None
+        logger.info(
+            "[RemoteG2NixlTransferAdapter] initialized — agent_name=%s",
+            agent_name,
+        )
 
     def start_transfer(self, record: RemoteG2BindingRecord) -> RemoteG2TransferResult:
         if not record.is_transfer_ready:
             raise RemoteG2TransferError("remote G2 binding is not transfer-ready")
 
+        logger.info(
+            "[RemoteG2NixlTransferAdapter] start_transfer: request=%s "
+            "source_worker=%s blocks=%d",
+            record.request_id, record.plan.source_worker_id,
+            len(record.bound_blocks),
+        )
         source_metadata = self._source_metadata_cache.get_or_refresh(
             record.plan.source_worker_id,
             record.source_generation,
@@ -195,6 +208,14 @@ class RemoteG2NixlTransferAdapter:
             source_metadata.remote_name,
         )
         status = agent.submit_transfer_requests(request)
+        logger.info(
+            "[RemoteG2NixlTransferAdapter] NIXL READ submitted: request=%s "
+            "source_remote=%s src_blocks=%d tgt_blocks=%d src_type=%s tgt_type=%s",
+            record.request_id, source_metadata.remote_name,
+            len(source_descs), len(target_descs),
+            source_descs[0].memory_type if source_descs else "?",
+            target_descs[0].memory_type if target_descs else "?",
+        )
         return RemoteG2TransferResult(
             record=record,
             source_metadata=source_metadata,

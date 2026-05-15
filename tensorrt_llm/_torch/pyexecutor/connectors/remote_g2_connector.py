@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger("tensorrt_llm.remote_g2")
 
 from .kv_cache_connector import (
     KvCacheConnectorScheduler,
@@ -64,14 +67,39 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
                 observability=self._observability,
             )
         )
+        logger.info(
+            "[RemoteG2Scheduler] initialized — resolve_and_lease=%s, "
+            "release_lease=%s, plan_store=%s, binding_store=%s",
+            "WIRED" if resolve_and_lease is not None else "NONE (plans will be ignored)",
+            "WIRED" if release_lease is not None else "NONE (using default no-op)",
+            type(self._plan_store).__name__,
+            type(self._binding_store).__name__,
+        )
 
     def get_num_new_matched_tokens(
         self, request: Any, num_computed_tokens: int
     ) -> tuple[int, bool]:
         plan = self._plan_store.get(request.request_id)
         if plan is None or self._resolve_and_lease is None:
+            if plan is None:
+                logger.debug(
+                    "[RemoteG2Scheduler] get_num_new_matched_tokens: no plan for request=%s",
+                    request.request_id,
+                )
+            else:
+                logger.warning(
+                    "[RemoteG2Scheduler] get_num_new_matched_tokens: plan found for request=%s "
+                    "but resolve_and_lease is NONE — cannot resolve",
+                    request.request_id,
+                )
             return (0, False)
 
+        logger.info(
+            "[RemoteG2Scheduler] resolving plan for request=%s plan_id=%s "
+            "source_worker=%s tier=%s planned_blocks=%d computed_tokens=%d",
+            request.request_id, plan.plan_id, plan.source_worker_id,
+            plan.source_tier, plan.planned_prefix_blocks, num_computed_tokens,
+        )
         record = self._binding_store.resolve_for_request(
             request.request_id,
             plan,
@@ -79,7 +107,15 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
             self._resolve_and_lease,
         )
         if record is None:
+            logger.info(
+                "[RemoteG2Scheduler] resolve returned no record for request=%s — fallback to local",
+                request.request_id,
+            )
             return (0, False)
+        logger.info(
+            "[RemoteG2Scheduler] resolved request=%s matched_tokens=%d lease_id=%s",
+            request.request_id, record.matched_tokens, record.lease_id,
+        )
         return (record.matched_tokens, True)
 
     def update_state_after_alloc(self, request: Any, block_ids: list[int]) -> None:
@@ -100,7 +136,13 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
             record = self._binding_store.get(request_id)
             if record is not None and record.is_transfer_ready:
                 bindings.append(record)
-        return RemoteG2ConnectorMetadata(tuple(bindings))
+        meta = RemoteG2ConnectorMetadata(tuple(bindings))
+        if bindings:
+            logger.info(
+                "[RemoteG2Scheduler] build_connector_meta: %d transfer-ready bindings queued",
+                len(bindings),
+            )
+        return meta
 
     def request_finished(self, request: Any, cache_block_ids: list[int]) -> bool:
         self._binding_store.discard(request.request_id, "request_finished")
@@ -130,9 +172,19 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
+        logger.info(
+            "[RemoteG2Worker] initialized — transfer_adapter=%s, "
+            "release_lease=%s, mark_local_valid=%s, publish_binding=%s, timeout_ms=%d",
+            type(transfer_adapter).__name__ if transfer_adapter is not None else "NONE",
+            "WIRED" if release_lease is not None else "NONE",
+            "WIRED" if mark_local_valid is not None else "NONE",
+            "WIRED" if publish_binding is not None else "NONE",
+            transfer_timeout_ms,
+        )
 
     def register_kv_caches(self, kv_cache_tensor: Any) -> None:
         self._kv_cache_tensor = kv_cache_tensor
+        logger.info("[RemoteG2Worker] register_kv_caches called — KV tensors registered")
 
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
@@ -153,8 +205,18 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             request_id = record.request_id
             if request_id in self._active_loads or request_id in self._completed_loads:
                 continue
+            logger.info(
+                "[RemoteG2Worker] start_transfer: request=%s plan_id=%s "
+                "source_worker=%s blocks=%d lease_id=%s",
+                request_id, record.plan.plan_id, record.plan.source_worker_id,
+                len(record.bound_blocks), record.lease_id,
+            )
             try:
                 result = self._transfer_adapter.start_transfer(record)
+                logger.info(
+                    "[RemoteG2Worker] transfer submitted: request=%s — NIXL READ in flight",
+                    request_id,
+                )
             except Exception as exc:
                 self._emit_record_event(
                     "fallback",
@@ -203,6 +265,12 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
                 raise RuntimeError("remote G2 transfer failed closed") from exc
 
             if completed:
+                logger.info(
+                    "[RemoteG2Worker] transfer COMPLETED: request=%s plan_id=%s "
+                    "blocks=%d tokens=%d elapsed_ms=%d",
+                    request_id, record.plan.plan_id, len(record.bound_blocks),
+                    record.matched_tokens, _now_ms() - active.started_at_ms,
+                )
                 try:
                     self._release_transfer_result_once(active.result)
                     self._emit_record_event(

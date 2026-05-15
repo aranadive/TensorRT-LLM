@@ -55,6 +55,16 @@ class NullRemoteG2ObservabilitySink(RemoteG2ObservabilitySink):
         return
 
 
+class LoggingRemoteG2ObservabilitySink(RemoteG2ObservabilitySink):
+    """Emits every remote G2 lifecycle event to a Python logger at INFO level."""
+
+    def __init__(self, logger: logging.Logger | None = None) -> None:
+        self._logger = logger or logging.getLogger("tensorrt_llm.remote_g2")
+
+    def emit(self, event: RemoteG2LifecycleEvent) -> None:
+        log_remote_g2_event(event, self._logger)
+
+
 class InMemoryRemoteG2ObservabilitySink(RemoteG2ObservabilitySink):
     def __init__(self) -> None:
         self.events: list[RemoteG2LifecycleEvent] = []
