@@ -247,6 +247,11 @@ public:
         NB_OVERRIDE_PURE(getPrimaryPool, layer_idx);
     }
 
+    tensorrt_llm::runtime::ITensor::SharedPtr getSecondaryPool(SizeType32 layer_idx) const override
+    {
+        NB_OVERRIDE_PURE(getSecondaryPool, layer_idx);
+    }
+
     tensorrt_llm::runtime::ITensor::SharedPtr getIndexerKCachePool() const override
     {
         NB_OVERRIDE_PURE(getIndexerKCachePool);
@@ -525,6 +530,19 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                     return pool.index({pool_layer_idx});
                 }
                 // Standard layout: pool[:, pool_layer_idx]
+                return pool.index({torch::indexing::Slice(), pool_layer_idx});
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_secondary_pool_data",
+            [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getSecondaryPool(layer_idx));
+                auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
+                if (self.isPoolLayerFirst(layer_idx))
+                {
+                    return pool.index({pool_layer_idx});
+                }
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             },
             nb::call_guard<nb::gil_scoped_release>())
