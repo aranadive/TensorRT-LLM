@@ -3975,6 +3975,134 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
 }
 
+// Regression guard for the slotIdx / blockId fields that external descriptor
+// registries depend on. Verifies that the cache manager populates these
+// fields at the three emission sites we care about: Stored (admission),
+// Updated/offload (primary->secondary), and Updated/onboard (secondary->primary).
+TEST_F(KVCacheManagerTest, KVCacheManagerEventSlotIdxAndBlockId)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 2;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto constexpr beamWidth = 1;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto const maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto const maxAttentionWindow = maxSequenceLength;
+    auto const blocksPerWindow
+        = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxSequenceLength,
+        maxSequenceLength, true, CacheType::kSELF, std::nullopt, std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+    (void) getEvents(kvCacheManager); // drain Created event
+
+    auto const expectValidStoredBlock = [&](tle::KVCacheStoredBlockData const& b)
+    {
+        EXPECT_EQ(b.cacheLevel, 0);
+        EXPECT_GE(b.slotIdx, 0);
+        EXPECT_LT(b.slotIdx, blocksInPrimaryPool);
+        EXPECT_GE(b.blockId, 0);
+        EXPECT_LT(b.blockId, blocksInPrimaryPool + blocksInSecondaryPool);
+    };
+
+    // Admission — Stored event should carry valid slotIdx and blockId.
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
+    kvCacheManager.addSequenceBatch({{{0, inputTokens0->size(), beamWidth}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+
+    auto events = getEvents(kvCacheManager);
+    ASSERT_EQ(events.size(), 1);
+    ASSERT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
+    auto storedBlocks = std::get<tle::KVCacheStoredData>(events.front().data).blocks;
+    ASSERT_GE(storedBlocks.size(), 1);
+    for (auto const& b : storedBlocks)
+    {
+        expectValidStoredBlock(b);
+    }
+
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    // Offload — fill primary pool with two new sequences whose combined block
+    // count exceeds primary capacity, forcing eviction of request-0's blocks
+    // (refcount 0 in the free queue) to secondary. The eviction emits
+    // Updated events with cacheLevel 0 -> 1.
+    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
+    auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    auto llmRequest2 = std::make_shared<LlmRequest>(2, 0, inputTokens2, samplingConfig, true);
+    kvCacheManager.addSequenceBatch({{{1, static_cast<SizeType32>(inputTokens1->size()), beamWidth},
+                                        {2, static_cast<SizeType32>(inputTokens2->size()), beamWidth}}},
+        {std::ref(*llmRequest1), std::ref(*llmRequest2)});
+
+    events = getEvents(kvCacheManager);
+    bool foundOffloadUpdate = false;
+    for (auto const& ev : events)
+    {
+        if (!std::holds_alternative<tle::KVCacheUpdatedData>(ev.data))
+        {
+            continue;
+        }
+        auto const& u = std::get<tle::KVCacheUpdatedData>(ev.data);
+        if (!u.cacheLevel.has_value() || u.cacheLevel->newValue != 1)
+        {
+            continue;
+        }
+        foundOffloadUpdate = true;
+        EXPECT_EQ(u.cacheLevel->oldValue, 0);
+        ASSERT_TRUE(u.newSlotIdx.has_value());
+        EXPECT_GE(u.newSlotIdx.value(), 0);
+        EXPECT_LT(u.newSlotIdx.value(), blocksInSecondaryPool);
+        EXPECT_GE(u.blockId, 0);
+        EXPECT_LT(u.blockId, blocksInPrimaryPool + blocksInSecondaryPool);
+    }
+    EXPECT_TRUE(foundOffloadUpdate);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
+    (void) kvCacheManager.removeSequence(1, llmRequest1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
+    (void) kvCacheManager.removeSequence(2, llmRequest2);
+
+    // Onboard — re-admit a sequence whose prefix matches request 0's tokens.
+    // The previously offloaded block on secondary gets onboarded back to primary,
+    // emitting an Updated event with cacheLevel 1 -> 0.
+    auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 1, 1, 1, 1, 0});
+    auto llmRequest3 = std::make_shared<LlmRequest>(3, 0, inputTokens3, samplingConfig, true);
+    kvCacheManager.addSequenceBatch({{{3, inputTokens3->size(), beamWidth}}}, {std::ref(*llmRequest3)});
+
+    events = getEvents(kvCacheManager);
+    bool foundOnboardUpdate = false;
+    for (auto const& ev : events)
+    {
+        if (!std::holds_alternative<tle::KVCacheUpdatedData>(ev.data))
+        {
+            continue;
+        }
+        auto const& u = std::get<tle::KVCacheUpdatedData>(ev.data);
+        if (!u.cacheLevel.has_value() || u.cacheLevel->newValue != 0)
+        {
+            continue;
+        }
+        foundOnboardUpdate = true;
+        EXPECT_EQ(u.cacheLevel->oldValue, 1);
+        ASSERT_TRUE(u.newSlotIdx.has_value());
+        EXPECT_GE(u.newSlotIdx.value(), 0);
+        EXPECT_LT(u.newSlotIdx.value(), blocksInPrimaryPool);
+        EXPECT_GE(u.blockId, 0);
+        EXPECT_LT(u.blockId, blocksInPrimaryPool + blocksInSecondaryPool);
+    }
+    EXPECT_TRUE(foundOnboardUpdate);
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
 {
     auto constexpr numLayers = 2;

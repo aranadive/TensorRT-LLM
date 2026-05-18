@@ -1254,8 +1254,10 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
 
         if (mEventManager && blockInRadixTree(block))
         {
-            mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+            mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(block->getHash())
+                                                   .cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel)
+                                                   .slotIdxUpdated(block->getMemoryPoolBlockIndex())
+                                                   .withBlockId(block->getBlockId()),
                 mWindowSize);
         }
         // Release block (now secondary after swap) into secondary block queue,
@@ -1355,8 +1357,10 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
 
         if (mEventManager)
         {
-            mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+            mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(offloadBlock->getHash())
+                                                   .cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel)
+                                                   .slotIdxUpdated(offloadBlock->getMemoryPoolBlockIndex())
+                                                   .withBlockId(offloadBlock->getBlockId()),
                 mWindowSize);
         }
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
@@ -1391,8 +1395,10 @@ void WindowBlockManager::offloadBlock(
 
         if (mEventManager && blockInRadixTree(block))
         {
-            mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+            mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(block->getHash())
+                                                   .cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel)
+                                                   .slotIdxUpdated(block->getMemoryPoolBlockIndex())
+                                                   .withBlockId(block->getBlockId()),
                 mWindowSize);
         }
         mEvictionPolicy->releaseBlock(offloadBlock); // append offloadBlock to mFreePrimaryBlocks queue
@@ -1637,7 +1643,8 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
         {
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(matchingBlock->getHash())
-                    .priorityUpdated(matchingBlock->getPriority(), *result.perBlockRetentions[bi].retentionPriority),
+                    .priorityUpdated(matchingBlock->getPriority(), *result.perBlockRetentions[bi].retentionPriority)
+                    .withBlockId(matchingBlock->getBlockId()),
                 mWindowSize);
         }
 

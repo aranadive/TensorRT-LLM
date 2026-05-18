@@ -231,6 +231,8 @@ void initBindings(nb::module_& m)
         .def_ro("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
         .def_ro("priority", &tle::KVCacheStoredBlockData::priority)
         .def_ro("cache_salt", &tle::KVCacheStoredBlockData::cacheSalt)
+        .def_ro("slot_idx", &tle::KVCacheStoredBlockData::slotIdx)
+        .def_ro("block_id", &tle::KVCacheStoredBlockData::blockId)
         .def_prop_ro("mm_keys",
             [](tle::KVCacheStoredBlockData const& self)
             {
@@ -264,7 +266,9 @@ void initBindings(nb::module_& m)
     nb::class_<tle::KVCacheUpdatedData>(executor_kv_cache, "KVCacheUpdatedData")
         .def_ro("block_hash", &tle::KVCacheUpdatedData::blockHash)
         .def_ro("cache_level", &tle::KVCacheUpdatedData::cacheLevel)
-        .def_ro("priority", &tle::KVCacheUpdatedData::priority);
+        .def_ro("priority", &tle::KVCacheUpdatedData::priority)
+        .def_ro("new_slot_idx", &tle::KVCacheUpdatedData::newSlotIdx)
+        .def_ro("block_id", &tle::KVCacheUpdatedData::blockId);
 
     nb::class_<tle::KVCacheEvent>(executor_kv_cache, "KVCacheEvent")
         .def_ro("event_id", &tle::KVCacheEvent::eventId)
