@@ -4939,6 +4939,79 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
 
+// Verifies the symmetric pinBlocksById(blockIds) API: pinning a free-queue
+// block must claim it out of the queue before incRef, an unpin returns it,
+// and N pins compose via refcount (only the Nth unpin releases).
+TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        maxAttentionWindow, maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    LlmRequest::RequestIdType requestId{0};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+
+    // Admit a sequence and store its context blocks so they end up tree-attached
+    // with refcount 0 after the sequence is removed — exactly the state our
+    // lease handler will encounter when a peer requests a previously-stored hash.
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    auto const allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
+    std::vector<SizeType32> blockIds(allBlockIds.begin(), allBlockIds.end());
+    ASSERT_GE(blockIds.size(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    kvCacheManager.storeContextBlocks(*llmRequest);
+    (void) kvCacheManager.removeSequence(requestId, llmRequest);
+
+    auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
+    auto const freeAfterRemove = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterRemove, totalBlocks);
+
+    // pinBlocksById from the free queue: the block must be claimed out of the
+    // queue and have its refcount incremented. Free count drops by exactly
+    // the number of blocks pinned.
+    kvCacheManager.pinBlocksById(blockIds);
+    auto const freeAfterPin = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterPin, totalBlocks - static_cast<SizeType32>(blockIds.size()));
+
+    // Symmetric unpin returns every block to the free queue.
+    kvCacheManager.unpinBlocksById(blockIds);
+    auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterUnpin, totalBlocks);
+
+    // Refcount composition: two pins on the same blocks require two unpins
+    // before they return to the free queue.
+    kvCacheManager.pinBlocksById(blockIds);
+    kvCacheManager.pinBlocksById(blockIds);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks - static_cast<SizeType32>(blockIds.size()));
+
+    kvCacheManager.unpinBlocksById(blockIds);
+    // One unpin removed — the blocks are still pinned (refcount 1 each).
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks - static_cast<SizeType32>(blockIds.size()));
+
+    kvCacheManager.unpinBlocksById(blockIds);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks);
+}
+
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
 // that sits in the eviction free queue must call claimBlock() before incRefCount().
 // Without the fix, unpinBlocksById inserts the block into the free queue a second

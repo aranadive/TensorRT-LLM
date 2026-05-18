@@ -2930,6 +2930,17 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
     firstManager.unpinBlocksById(blockIds);
 }
 
+void BlockManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
+    // Use the first window size, matching unpinBlocksById.
+    if (mWindowBlockManagers.empty())
+    {
+        return;
+    }
+    auto& firstManager = mWindowBlockManagers.begin()->second;
+    firstManager.pinBlocksById(blockIds);
+}
+
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
     auto const requestId = sequence.getRequestId();
@@ -2959,6 +2970,32 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
             {
                 mEvictionPolicy->releaseBlock(block);
             }
+        }
+    }
+}
+
+void WindowBlockManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
+    if (blockIds.empty())
+    {
+        return;
+    }
+
+    for (auto const& blockId : blockIds)
+    {
+        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+            "Block id %d is out of range", blockId);
+        auto block = mAllBlocksById[blockId];
+        if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+        {
+            // If the block has no refs it sits in the eviction policy's free
+            // queue. Claim it first so the matching unpinBlocksById /
+            // releaseBlock cycle does not create a duplicate queue entry.
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+            }
+            block->incRefCount();
         }
     }
 }
@@ -3917,6 +3954,11 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     mBlockManager.unpinBlocksById(blockIds);
+}
+
+void KVCacheManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
+    mBlockManager.pinBlocksById(blockIds);
 }
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const

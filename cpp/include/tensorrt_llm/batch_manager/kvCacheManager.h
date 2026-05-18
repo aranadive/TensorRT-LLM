@@ -1225,6 +1225,14 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    //! \brief Pin blocks by block ids directly. For each id, if the block is
+    //! currently in the eviction policy's free queue (refcount 0), claim it
+    //! out of the queue before incrementing the refcount, so the unpin path
+    //! does not create a duplicate queue entry. Multiple pins on the same
+    //! block compose via refcount: only the matching count of unpins returns
+    //! the block to the free queue.
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
 
     void resetReuseState()
@@ -1524,6 +1532,8 @@ public:
     void pinBlocks(GenerationRequest& sequence);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -2180,6 +2190,8 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
+    virtual void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.
     /// @param targetTokens The full token sequence whose cached blocks are walked.
     /// @param numTokensToKeep Number of prefix tokens to retain. Blocks whose cumulative
@@ -2535,6 +2547,8 @@ public:
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
