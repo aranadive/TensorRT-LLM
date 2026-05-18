@@ -105,7 +105,8 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
     for (auto const& block : blocks)
     {
         data.blocks.emplace_back(block->getHash(), block->getUniqueTokens(), block->getBlockKey().loraTaskId,
-            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority(), block->getExtraKeys());
+            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority(), block->getExtraKeys(),
+            block->getMemoryPoolBlockIndex(), block->getBlockId());
     }
 
     enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});

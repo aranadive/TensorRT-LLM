@@ -1716,13 +1716,15 @@ struct KVCacheStoredBlockData
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
-        std::vector<MmKey> mmKeys = {})
+        std::vector<MmKey> mmKeys = {}, SizeType32 slotIdx = -1, SizeType32 blockId = -1)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
         , mmKeys{std::move(mmKeys)}
+        , slotIdx{slotIdx}
+        , blockId{blockId}
     {
     }
 
@@ -1738,6 +1740,12 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
     /// @brief The multimodal keys of the block
     std::vector<MmKey> mmKeys;
+    /// @brief The slot index within the cache-level pool (-1 if unknown).
+    /// Used by external descriptor registries to compute byte offsets.
+    SizeType32 slotIdx;
+    /// @brief The stable id of the underlying KVCacheBlock metadata object
+    /// (-1 if unknown). Used by external registries to invoke pin/unpin APIs.
+    SizeType32 blockId;
 };
 
 struct KVCacheStoredData
@@ -1768,10 +1776,13 @@ struct KVCacheUpdatedData
         : blockHash{blockHash} {};
 
     explicit KVCacheUpdatedData(IdType blockHash, std::optional<KVCacheEventDiff<SizeType32>> cacheLevel,
-        std::optional<KVCacheEventDiff<SizeType32>> priority)
+        std::optional<KVCacheEventDiff<SizeType32>> priority, std::optional<SizeType32> newSlotIdx = std::nullopt,
+        SizeType32 blockId = -1)
         : blockHash{blockHash}
         , cacheLevel{cacheLevel}
-        , priority{priority} {};
+        , priority{priority}
+        , newSlotIdx{newSlotIdx}
+        , blockId{blockId} {};
 
     KVCacheUpdatedData& cacheLevelUpdated(SizeType32 oldValue, SizeType32 newValue)
     {
@@ -1785,12 +1796,30 @@ struct KVCacheUpdatedData
         return *this;
     }
 
+    KVCacheUpdatedData& slotIdxUpdated(SizeType32 newValue)
+    {
+        newSlotIdx = newValue;
+        return *this;
+    }
+
+    KVCacheUpdatedData& withBlockId(SizeType32 newBlockId)
+    {
+        blockId = newBlockId;
+        return *this;
+    }
+
     /// @brief The hash of the updated block
     IdType blockHash;
     /// @brief The updated value of the cacheLevel field
     std::optional<KVCacheEventDiff<SizeType32>> cacheLevel = std::nullopt;
     /// @brief The updated value of the priority field
     std::optional<KVCacheEventDiff<SizeType32>> priority = std::nullopt;
+    /// @brief The new slot index after a tier change (offload/onboard).
+    /// Populated only when cacheLevel is set; std::nullopt otherwise.
+    std::optional<SizeType32> newSlotIdx = std::nullopt;
+    /// @brief The stable id of the underlying KVCacheBlock metadata object
+    /// (-1 if unknown). Stable across offload/onboard.
+    SizeType32 blockId = -1;
 };
 
 using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVCacheRemovedData, KVCacheUpdatedData>;

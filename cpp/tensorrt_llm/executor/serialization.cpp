@@ -2435,6 +2435,8 @@ size_t Serialization::serializedSize(KVCacheStoredBlockData const& data)
     totalSize += su::serializedSize(data.cacheLevel);
     totalSize += su::serializedSize(data.priority);
     totalSize += su::serializedSize(data.mmKeys);
+    totalSize += su::serializedSize(data.slotIdx);
+    totalSize += su::serializedSize(data.blockId);
     return totalSize;
 }
 
@@ -2446,6 +2448,8 @@ void Serialization::serialize(KVCacheStoredBlockData const& data, std::ostream& 
     su::serialize(data.cacheLevel, os);
     su::serialize(data.priority, os);
     su::serialize(data.mmKeys, os);
+    su::serialize(data.slotIdx, os);
+    su::serialize(data.blockId, os);
 }
 
 KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::istream& is)
@@ -2456,8 +2460,10 @@ KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::ist
     auto cacheLevel = su::deserialize<SizeType32>(is);
     auto priority = su::deserialize<SizeType32>(is);
     auto mmKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
+    auto slotIdx = su::deserialize<SizeType32>(is);
+    auto blockId = su::deserialize<SizeType32>(is);
 
-    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority, mmKeys};
+    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority, mmKeys, slotIdx, blockId};
 }
 
 // KVcacheRemovedData
@@ -2512,6 +2518,8 @@ size_t Serialization::serializedSize(KVCacheUpdatedData const& data)
     totalSize += su::serializedSize(data.blockHash);
     totalSize += su::serializedSize(data.cacheLevel);
     totalSize += su::serializedSize(data.priority);
+    totalSize += su::serializedSize(data.newSlotIdx);
+    totalSize += su::serializedSize(data.blockId);
     return totalSize;
 }
 
@@ -2520,6 +2528,8 @@ void Serialization::serialize(KVCacheUpdatedData const& data, std::ostream& os)
     su::serialize(data.blockHash, os);
     su::serialize(data.cacheLevel, os);
     su::serialize(data.priority, os);
+    su::serialize(data.newSlotIdx, os);
+    su::serialize(data.blockId, os);
 }
 
 KVCacheUpdatedData Serialization::deserializeKVCacheUpdatedData(std::istream& is)
@@ -2527,7 +2537,9 @@ KVCacheUpdatedData Serialization::deserializeKVCacheUpdatedData(std::istream& is
     auto blockHash = su::deserialize<IdType>(is);
     auto cacheLevel = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
     auto priority = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
-    return KVCacheUpdatedData{blockHash, cacheLevel, priority};
+    auto newSlotIdx = su::deserialize<std::optional<SizeType32>>(is);
+    auto blockId = su::deserialize<SizeType32>(is);
+    return KVCacheUpdatedData{blockHash, cacheLevel, priority, newSlotIdx, blockId};
 }
 
 // MmKey

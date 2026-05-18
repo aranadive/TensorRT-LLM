@@ -916,6 +916,8 @@ void compareKvCacheEvents(texec::KVCacheEvent const& kvCacheEvent, texec::KVCach
             EXPECT_EQ(blockData.loraId, blockData2.loraId);
             EXPECT_EQ(blockData.cacheLevel, blockData2.cacheLevel);
             EXPECT_EQ(blockData.priority, blockData2.priority);
+            EXPECT_EQ(blockData.slotIdx, blockData2.slotIdx);
+            EXPECT_EQ(blockData.blockId, blockData2.blockId);
             EXPECT_EQ(blockData.tokens.size(), blockData2.tokens.size());
             for (size_t j = 0; j < blockData.tokens.size(); ++j)
             {
@@ -942,6 +944,12 @@ void compareKvCacheEvents(texec::KVCacheEvent const& kvCacheEvent, texec::KVCach
             EXPECT_EQ(data.priority.value().oldValue, data2.priority.value().oldValue);
             EXPECT_EQ(data.priority.value().newValue, data2.priority.value().newValue);
         }
+        EXPECT_EQ(data.newSlotIdx.has_value(), data2.newSlotIdx.has_value());
+        if (data.newSlotIdx.has_value())
+        {
+            EXPECT_EQ(data.newSlotIdx.value(), data2.newSlotIdx.value());
+        }
+        EXPECT_EQ(data.blockId, data2.blockId);
     }
     else
     {
@@ -959,15 +967,15 @@ TEST(SerializeUtilsTest, KvCacheEventsDeque)
     texec::KVCacheEvent kvCacheRemovedEvent(1, texec::KVCacheRemovedData{{3, 4}}, 32);
 
     // Stored event
-    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
-    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101);
+    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99, {}, 5, 42);
+    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101, {}, 7, 99);
     texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData1, storedBlockData2}};
     texec::KVCacheEvent kvCacheStoredEvent(1, kvCacheStoredData, 32);
 
     // Updated event
     texec::KVCacheEventDiff<texec::SizeType32> diff{0, 1};
     texec::KVCacheEventDiff<texec::SizeType32> diff2{90, 99};
-    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2);
+    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2, /*newSlotIdx=*/13, /*blockId=*/57);
     texec::KVCacheEvent kvCacheEvent(1, kvCacheUpdatedData, 32);
 
     std::deque<texec::KVCacheEvent> kvCacheEvents{
@@ -1003,10 +1011,23 @@ TEST(SerializeUtilsTest, KVCacheRemovedEvents)
 // Test for KVCacheEvent with KVCacheStoredData
 TEST(SerializeUtilsTest, KVCacheStoredEvent)
 {
-    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
-    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101);
+    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99, {}, 5, 42);
+    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101, {}, 7, 99);
 
     texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData1, storedBlockData2}};
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheStoredData, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test that KVCacheStoredBlockData with default slotIdx/blockId (back-compat)
+// round-trips successfully.
+TEST(SerializeUtilsTest, KVCacheStoredEventDefaultSlotBlockId)
+{
+    auto storedBlockData = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
+    EXPECT_EQ(storedBlockData.slotIdx, -1);
+    EXPECT_EQ(storedBlockData.blockId, -1);
+    texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData}};
     texec::KVCacheEvent kvCacheEvent(1, kvCacheStoredData, 32);
     auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
     compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
@@ -1017,8 +1038,42 @@ TEST(SerializeUtilsTest, KVCacheUpdatedEvent)
 {
     texec::KVCacheEventDiff<texec::SizeType32> diff{0, 1};
     texec::KVCacheEventDiff<texec::SizeType32> diff2{90, 99};
-    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2);
+    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2, /*newSlotIdx=*/13, /*blockId=*/57);
     texec::KVCacheEvent kvCacheEvent(1, kvCacheUpdatedData, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test that KVCacheUpdatedData builder methods (slotIdxUpdated, withBlockId)
+// produce a payload that round-trips through serialization.
+TEST(SerializeUtilsTest, KVCacheUpdatedEventBuilderMethods)
+{
+    texec::KVCacheUpdatedData data(123);
+    data.cacheLevelUpdated(0, 1).slotIdxUpdated(8).withBlockId(64);
+
+    EXPECT_TRUE(data.cacheLevel.has_value());
+    EXPECT_EQ(data.cacheLevel.value().oldValue, 0);
+    EXPECT_EQ(data.cacheLevel.value().newValue, 1);
+    EXPECT_TRUE(data.newSlotIdx.has_value());
+    EXPECT_EQ(data.newSlotIdx.value(), 8);
+    EXPECT_EQ(data.blockId, 64);
+
+    texec::KVCacheEvent kvCacheEvent(1, data, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test that KVCacheUpdatedData with default newSlotIdx (nullopt) and
+// blockId (-1) — e.g., for priority-only updates — round-trips.
+TEST(SerializeUtilsTest, KVCacheUpdatedEventDefaultSlotBlockId)
+{
+    texec::KVCacheUpdatedData data(456);
+    data.priorityUpdated(10, 20);
+
+    EXPECT_FALSE(data.newSlotIdx.has_value());
+    EXPECT_EQ(data.blockId, -1);
+
+    texec::KVCacheEvent kvCacheEvent(1, data, 32);
     auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
     compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
 }
