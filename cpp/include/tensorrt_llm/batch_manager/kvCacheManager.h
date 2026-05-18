@@ -1117,7 +1117,13 @@ public:
     //! does not create a duplicate queue entry. Multiple pins on the same
     //! block compose via refcount: only the matching count of unpins returns
     //! the block to the free queue.
-    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+    //!
+    //! Returns a vector of (slot_idx, cache_level) pairs in the same order
+    //! as the input blockIds, captured after the pin succeeds. This lets
+    //! callers obtain the authoritative post-pin physical location without
+    //! a separate query that could race with an in-flight offload/onboard.
+    std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
+        std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void resetReuseState()
     {
@@ -1401,7 +1407,8 @@ public:
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+    std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
+        std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -2013,7 +2020,9 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
-    virtual void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+    virtual std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
+        std::vector<KVCacheBlock::IdType> const& blockIds)
+        = 0;
 
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
@@ -2322,7 +2331,8 @@ public:
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
-    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+    std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
+        std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
