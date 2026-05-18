@@ -4766,6 +4766,43 @@ TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks);
 }
 
+// Verifies that BaseKVCacheManager exposes both primary and secondary pool
+// tensors per layer. External descriptor registries need the secondary base
+// pointer to translate slot indices for blocks living on the host-pinned tier.
+TEST_F(KVCacheManagerTest, GetPrimaryAndSecondaryPool)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 2;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        maxAttentionWindow, maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+    {
+        auto primary = kvCacheManager.getPrimaryPool(layerIdx);
+        auto secondary = kvCacheManager.getSecondaryPool(layerIdx);
+        ASSERT_NE(primary, nullptr);
+        ASSERT_NE(secondary, nullptr);
+        EXPECT_NE(primary->data(), secondary->data());
+        // Pool shapes should match between tiers — same per-layer block layout,
+        // just different residency and block count.
+        EXPECT_EQ(primary->getShape().nbDims, secondary->getShape().nbDims);
+    }
+}
+
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
 // that sits in the eviction free queue must call claimBlock() before incRefCount().
 // Without the fix, unpinBlocksById inserts the block into the free queue a second

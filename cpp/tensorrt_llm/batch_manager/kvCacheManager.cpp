@@ -4277,6 +4277,11 @@ runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx)
     return mBlockManager.getPrimaryPool(mBlockManager.getLayerPoolIdx(layer_idx));
 }
 
+runtime::ITensor::SharedPtr KVCacheManager::getSecondaryPool(SizeType32 layer_idx) const
+{
+    return mBlockManager.getSecondaryPool(mBlockManager.getLayerPoolIdx(layer_idx));
+}
+
 runtime::ITensor::SharedPtr KVCacheManager::getIndexerKCachePool() const
 {
     return mIndexerKCachePoolPointers;

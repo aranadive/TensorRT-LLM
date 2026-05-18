@@ -1924,6 +1924,7 @@ public:
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getSecondaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual bool isPoolLayerFirst(SizeType32 layer_idx) const = 0;
@@ -2346,6 +2347,7 @@ public:
 
     runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
+    runtime::ITensor::SharedPtr getSecondaryPool(SizeType32 layer_idx) const override;
     runtime::ITensor::SharedPtr getIndexerKCachePool() const override;
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
