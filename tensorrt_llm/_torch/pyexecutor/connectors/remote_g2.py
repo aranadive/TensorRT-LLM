@@ -252,6 +252,7 @@ class SourceG2DescriptorRecord:
     pool_id: str
     byte_offset: int
     byte_length: int
+    block_id: int = -1
     live: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
     lease_count: int = 0
