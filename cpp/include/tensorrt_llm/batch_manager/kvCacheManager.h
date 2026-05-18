@@ -1111,6 +1111,14 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    //! \brief Pin blocks by block ids directly. For each id, if the block is
+    //! currently in the eviction policy's free queue (refcount 0), claim it
+    //! out of the queue before incrementing the refcount, so the unpin path
+    //! does not create a duplicate queue entry. Multiple pins on the same
+    //! block compose via refcount: only the matching count of unpins returns
+    //! the block to the free queue.
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
     void resetReuseState()
     {
         std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -1392,6 +1400,8 @@ public:
     void pinBlocks(GenerationRequest& sequence);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -2002,6 +2012,8 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
+    virtual void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
     //! @param windowSize The attention window size this block belongs to.
@@ -2308,6 +2320,8 @@ public:
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    void pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
