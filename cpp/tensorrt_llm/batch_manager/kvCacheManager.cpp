@@ -2930,15 +2930,16 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
     firstManager.unpinBlocksById(blockIds);
 }
 
-void BlockManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+std::vector<std::pair<SizeType32, SizeType32>> BlockManager::pinBlocksById(
+    std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     // Use the first window size, matching unpinBlocksById.
     if (mWindowBlockManagers.empty())
     {
-        return;
+        return {};
     }
     auto& firstManager = mWindowBlockManagers.begin()->second;
-    firstManager.pinBlocksById(blockIds);
+    return firstManager.pinBlocksById(blockIds);
 }
 
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
@@ -2974,12 +2975,18 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
     }
 }
 
-void WindowBlockManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+std::vector<std::pair<SizeType32, SizeType32>> WindowBlockManager::pinBlocksById(
+    std::vector<KVCacheBlock::IdType> const& blockIds)
 {
+    std::vector<std::pair<SizeType32, SizeType32>> locations;
+    locations.reserve(blockIds.size());
     if (blockIds.empty())
     {
-        return;
+        return locations;
     }
+
+    static constexpr SizeType32 kPrimaryLevel = 0;
+    static constexpr SizeType32 kSecondaryLevel = 1;
 
     for (auto const& blockId : blockIds)
     {
@@ -2996,8 +3003,17 @@ void WindowBlockManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& 
                 mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
             }
             block->incRefCount();
+            // Capture the post-pin (slot, level) atomically with the pin so
+            // callers cannot observe a slot that diverges from the held pin.
+            locations.emplace_back(
+                block->getMemoryPoolBlockIndex(), block->isPrimary() ? kPrimaryLevel : kSecondaryLevel);
+        }
+        else
+        {
+            locations.emplace_back(-1, -1);
         }
     }
+    return locations;
 }
 
 // Only in TRT path
@@ -3956,9 +3972,10 @@ void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bl
     mBlockManager.unpinBlocksById(blockIds);
 }
 
-void KVCacheManager::pinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+std::vector<std::pair<SizeType32, SizeType32>> KVCacheManager::pinBlocksById(
+    std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    mBlockManager.pinBlocksById(blockIds);
+    return mBlockManager.pinBlocksById(blockIds);
 }
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const

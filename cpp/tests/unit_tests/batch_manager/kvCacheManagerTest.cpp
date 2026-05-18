@@ -4988,10 +4988,21 @@ TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
 
     // pinBlocksById from the free queue: the block must be claimed out of the
     // queue and have its refcount incremented. Free count drops by exactly
-    // the number of blocks pinned.
-    kvCacheManager.pinBlocksById(blockIds);
+    // the number of blocks pinned. The returned (slot, level) pairs reflect
+    // the authoritative post-pin physical location of each block.
+    auto locations = kvCacheManager.pinBlocksById(blockIds);
     auto const freeAfterPin = kvCacheManager.getNumFreeBlocks();
     EXPECT_EQ(freeAfterPin, totalBlocks - static_cast<SizeType32>(blockIds.size()));
+
+    // Returned locations: one entry per input block_id; primary slot in range,
+    // level == 0 (admission lands on primary).
+    ASSERT_EQ(locations.size(), blockIds.size());
+    for (auto const& [slotIdx, cacheLevel] : locations)
+    {
+        EXPECT_EQ(cacheLevel, 0);
+        EXPECT_GE(slotIdx, 0);
+        EXPECT_LT(slotIdx, blocksInPrimaryPool);
+    }
 
     // Symmetric unpin returns every block to the free queue.
     kvCacheManager.unpinBlocksById(blockIds);
@@ -4999,9 +5010,11 @@ TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 
     // Refcount composition: two pins on the same blocks require two unpins
-    // before they return to the free queue.
-    kvCacheManager.pinBlocksById(blockIds);
-    kvCacheManager.pinBlocksById(blockIds);
+    // before they return to the free queue. Both pin calls return locations
+    // that match — pinning an already-pinned block does not move it.
+    auto firstPin = kvCacheManager.pinBlocksById(blockIds);
+    auto secondPin = kvCacheManager.pinBlocksById(blockIds);
+    EXPECT_EQ(firstPin, secondPin);
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks - static_cast<SizeType32>(blockIds.size()));
 
     kvCacheManager.unpinBlocksById(blockIds);
