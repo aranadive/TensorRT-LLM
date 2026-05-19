@@ -2107,6 +2107,38 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     return searchReuseTree(blockKeys);
 }
 
+std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>> WindowBlockManager::findBlockByHash(
+    size_t blockHash)
+{
+    static constexpr SizeType32 kPrimaryLevel = 0;
+    static constexpr SizeType32 kSecondaryLevel = 1;
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    for (auto const& block : mAllBlocksById)
+    {
+        if (block == nullptr || block->isPlaceholder())
+        {
+            continue;
+        }
+        if (block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+        {
+            continue;
+        }
+        // A block "caches" a hash only while attached to the lookup tree.
+        if (block->getLookupNode() == nullptr)
+        {
+            continue;
+        }
+        if (block->getHash() != blockHash)
+        {
+            continue;
+        }
+        return std::make_tuple(block->getBlockId(), block->getMemoryPoolBlockIndex(),
+            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel);
+    }
+    return std::nullopt;
+}
+
 std::shared_ptr<KVCacheBlock> WindowBlockManager::searchReuseTree(std::vector<BlockKey> const& blockKeys)
 {
     if (blockKeys.empty())

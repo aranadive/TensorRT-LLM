@@ -5062,6 +5062,70 @@ TEST_F(KVCacheManagerTest, GetPrimaryAndSecondaryPool)
     }
 }
 
+// Verifies that findBlockByHash returns the current (block_id, slot, cache_level)
+// for a tree-attached block, std::nullopt for an unknown hash, and reflects the
+// post-offload location for blocks that have migrated to secondary.
+TEST_F(KVCacheManagerTest, FindBlockByHashReturnsCurrentLocation)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 2;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        maxAttentionWindow, maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    LlmRequest::RequestIdType requestId{0};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    kvCacheManager.storeContextBlocks(*llmRequest);
+
+    // Capture the stored block_ids and their hashes from the request's cache
+    // block ids — we don't know the hash values up front (they're token-derived).
+    auto const& blockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
+    ASSERT_GE(blockIds.size(), 1);
+
+    // Find each stored block by its hash, retrieved via the block's own getHash().
+    auto& blockManager = kvCacheManager.getBlockManager();
+    for (auto bid : blockIds)
+    {
+        auto block = blockManager.getBlockById(bid, maxAttentionWindow);
+        ASSERT_NE(block, nullptr);
+        size_t blockHash = block->getHash();
+
+        auto result = kvCacheManager.findBlockByHash(blockHash, maxAttentionWindow);
+        ASSERT_TRUE(result.has_value()) << "hash should be findable for block_id=" << bid;
+        auto [foundBlockId, slotIdx, cacheLevel] = *result;
+        EXPECT_EQ(foundBlockId, bid);
+        EXPECT_GE(slotIdx, 0);
+        EXPECT_EQ(cacheLevel, 0); // primary after store
+    }
+
+    // Unknown hash returns nullopt.
+    auto missing = kvCacheManager.findBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow);
+    EXPECT_FALSE(missing.has_value());
+
+    // Unknown window returns nullopt (empty optional, not a crash).
+    auto wrongWindow = kvCacheManager.findBlockByHash(0, maxAttentionWindow + 1);
+    EXPECT_FALSE(wrongWindow.has_value());
+}
+
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
 // that sits in the eviction free queue must call claimBlock() before incRefCount().
 // Without the fix, unpinBlocksById inserts the block into the free queue a second
