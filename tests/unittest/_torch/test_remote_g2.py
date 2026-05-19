@@ -320,6 +320,93 @@ def test_source_registry_reports_first_missing_block_status():
     assert result.per_block_status[0].status == "missing"
 
 
+def test_source_registry_falls_back_to_find_block_by_hash_when_kv_provided():
+    # When the in-memory _records cache is empty and a kv handle is
+    # configured, resolve_and_lease should discover blocks via
+    # kv.find_block_by_hash and synthesize ephemeral records whose
+    # byte_offset and nixl_memory_desc.ptr are derived from the
+    # returned slot and the pool's base pointer.
+
+    BLOCK_SIZE_BYTES = 4096
+    POOL_BASE_PTR = 0x1000_0000
+    WINDOW_SIZE = 4096
+    PRIMARY_LEVEL = 0
+    SECONDARY_LEVEL = 1
+    locations = {
+        11: (42, 5, SECONDARY_LEVEL),
+        22: (88, 9, SECONDARY_LEVEL),
+    }
+    lookups: list[tuple[int, int]] = []
+    pins: list[tuple[int, int]] = []
+    unpinned: list[int] = []
+
+    class FakeKv:
+        def find_block_by_hash(self, block_hash, window_size):
+            lookups.append((int(block_hash), int(window_size)))
+            return locations.get(int(block_hash))
+
+    def acquire_pin(record, lease_id):
+        pins.append((record.block_id, record.byte_offset))
+        return record.block_id
+
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        source_generation=99,
+        clock_ms=lambda: 1_000,
+        acquire_pin=acquire_pin,
+        release_pin=unpinned.append,
+        require_trtllm_pin=True,
+        kv=FakeKv(),
+        window_size=WINDOW_SIZE,
+        pool_id="host-pool-0",
+        pool_base_ptr=POOL_BASE_PTR,
+        block_size_bytes=BLOCK_SIZE_BYTES,
+        tier="host_pinned",
+    )
+
+    result = registry.resolve_and_lease(_plan())
+
+    assert result.reason == "ok"
+    assert result.lease_id is not None
+    assert result.num_tokens == 2 * 16
+    assert [d.block_hash for d in result.descriptors] == [11, 22]
+    assert [d.byte_offset for d in result.descriptors] == [
+        5 * BLOCK_SIZE_BYTES,
+        9 * BLOCK_SIZE_BYTES,
+    ]
+    assert [d.metadata["nixl_memory_desc"]["ptr"] for d in result.descriptors] == [
+        POOL_BASE_PTR + 5 * BLOCK_SIZE_BYTES,
+        POOL_BASE_PTR + 9 * BLOCK_SIZE_BYTES,
+    ]
+    assert [status.status for status in result.per_block_status] == [
+        "live",
+        "live",
+        "missing",
+    ]
+    assert lookups == [(11, WINDOW_SIZE), (22, WINDOW_SIZE), (33, WINDOW_SIZE)]
+    assert pins == [(42, 5 * BLOCK_SIZE_BYTES), (88, 9 * BLOCK_SIZE_BYTES)]
+
+    assert registry.release_lease(result.lease_id, "success") is True
+    assert unpinned == [42, 88]
+
+
+def test_source_registry_kv_fallback_is_disabled_when_kv_is_none():
+    # Without a kv handle, resolve_and_lease must not synthesize records.
+    # An empty _records cache should return "missing" on the first hash,
+    # preserving the alpha-only behavior for legacy callers.
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        clock_ms=lambda: 1_000,
+    )
+
+    result = registry.resolve_and_lease(_plan(planned_prefix_blocks=1))
+
+    assert result.reason == "no_live_remote_g2_prefix"
+    assert result.per_block_status[0].status == "missing"
+
+
 def test_remote_plan_parser_truncates_prefix_to_hash_count():
     parsed = RemoteKvReusePlan.from_dict(_plan(planned_prefix_blocks=10))
 

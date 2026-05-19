@@ -763,6 +763,12 @@ class SourceG2DescriptorRegistry:
         acquire_pin: Optional[Callable[[SourceG2DescriptorRecord, str], Any]] = None,
         release_pin: Optional[Callable[[Any], None]] = None,
         require_trtllm_pin: bool = False,
+        kv: Optional[Any] = None,
+        window_size: Optional[int] = None,
+        pool_id: str = "",
+        pool_base_ptr: int = 0,
+        block_size_bytes: int = 0,
+        tier: str = "",
     ) -> None:
         self.source_worker_id = source_worker_id
         self.source_dp_rank = source_dp_rank
@@ -772,6 +778,12 @@ class SourceG2DescriptorRegistry:
         self._acquire_pin = acquire_pin
         self._release_pin = release_pin
         self._require_trtllm_pin = require_trtllm_pin
+        self._kv = kv
+        self._window_size = window_size
+        self._pool_id = pool_id
+        self._pool_base_ptr = int(pool_base_ptr)
+        self._block_size_bytes = int(block_size_bytes)
+        self._tier = tier
         self._records: dict[int, SourceG2DescriptorRecord] = {}
         self._leases: dict[str, RemoteG2Lease] = {}
         self._lock = threading.RLock()
@@ -838,6 +850,8 @@ class SourceG2DescriptorRegistry:
             per_block_status: list[RemoteG2BlockStatus] = []
             for block_hash in parsed.planned_hashes:
                 record = self._records.get(int(block_hash))
+                if record is None and self._kv is not None:
+                    record = self._lookup_via_find_block_by_hash(int(block_hash))
                 if record is None:
                     per_block_status.append(RemoteG2BlockStatus(int(block_hash), "missing"))
                     break
@@ -956,3 +970,41 @@ class SourceG2DescriptorRegistry:
     def _release_pin_ref(self, pin_ref: Any) -> None:
         if self._release_pin is not None:
             self._release_pin(pin_ref)
+
+    def _lookup_via_find_block_by_hash(
+        self, block_hash: int
+    ) -> Optional[SourceG2DescriptorRecord]:
+        """Resolve a block by hash through the C++ KV cache manager and
+        synthesize an ephemeral descriptor record. The slot read here is
+        not authoritative — the downstream acquire_pin callback pins the
+        block and re-anchors byte_offset / nixl_memory_desc.ptr to the
+        actual post-pin slot before the lease is committed.
+        """
+        if self._window_size is None or self._block_size_bytes <= 0:
+            return None
+        try:
+            loc = self._kv.find_block_by_hash(block_hash, int(self._window_size))
+        except Exception:
+            return None
+        if loc is None:
+            return None
+        block_id, slot_idx, _level = loc
+        byte_offset = int(slot_idx) * self._block_size_bytes
+        return SourceG2DescriptorRecord(
+            block_hash=block_hash,
+            source_worker_id=self.source_worker_id,
+            source_dp_rank=self.source_dp_rank,
+            tier=self._tier,
+            descriptor_generation=1,
+            pool_id=self._pool_id,
+            byte_offset=byte_offset,
+            byte_length=self._block_size_bytes,
+            block_id=int(block_id),
+            live=True,
+            metadata={
+                "nixl_memory_desc": {
+                    "ptr": self._pool_base_ptr + byte_offset,
+                    "len": self._block_size_bytes,
+                }
+            },
+        )
