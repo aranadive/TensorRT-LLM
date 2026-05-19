@@ -407,6 +407,71 @@ def test_source_registry_kv_fallback_is_disabled_when_kv_is_none():
     assert result.per_block_status[0].status == "missing"
 
 
+def test_source_registry_uses_kv_block_hashes_for_lookup_when_present():
+    # When a plan carries `kv_block_hashes` parallel to `block_hashes`,
+    # the source side must use the kv-side hash to look up records but
+    # report the router-side identity (block_hashes / tokens_hash) back
+    # in the descriptors and per-block status.
+
+    BLOCK_SIZE_BYTES = 4096
+    POOL_BASE_PTR = 0x1000_0000
+    WINDOW_SIZE = 4096
+    SECONDARY_LEVEL = 1
+
+    # Router-side identity: block_hashes (tokens hashes, e.g. 11/22/33).
+    # KV-side identity: kv_block_hashes (splitmix, distinct values).
+    tokens_hashes = [11, 22, 33]
+    kv_hashes = [0xAAAA_AAAA_AAAA_AAA1, 0xBBBB_BBBB_BBBB_BBB2, 0xCCCC_CCCC_CCCC_CCC3]
+    locations = {
+        kv_hashes[0]: (42, 5, SECONDARY_LEVEL),
+        kv_hashes[1]: (88, 9, SECONDARY_LEVEL),
+        # kv_hashes[2] intentionally absent — last block is "missing"
+    }
+    lookups: list[int] = []
+
+    class FakeKv:
+        def find_block_by_hash(self, block_hash, window_size):
+            lookups.append(int(block_hash))
+            return locations.get(int(block_hash))
+
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        source_generation=99,
+        clock_ms=lambda: 1_000,
+        acquire_pin=lambda record, lease_id: record.block_id,
+        release_pin=lambda _pin: None,
+        require_trtllm_pin=True,
+        kv=FakeKv(),
+        window_size=WINDOW_SIZE,
+        pool_id="host-pool-0",
+        pool_base_ptr=POOL_BASE_PTR,
+        block_size_bytes=BLOCK_SIZE_BYTES,
+        tier="host_pinned",
+    )
+
+    plan = _plan()
+    plan["block_hashes"] = tokens_hashes
+    plan["kv_block_hashes"] = kv_hashes
+    result = registry.resolve_and_lease(plan)
+
+    assert result.reason == "ok"
+    assert result.num_tokens == 2 * 16
+    # The descriptors must carry tokens hashes so the router can correlate.
+    assert [d.block_hash for d in result.descriptors] == [11, 22]
+    # The kv-side hashes are the ones used against kv.find_block_by_hash.
+    assert lookups == kv_hashes
+    # Per-block status reports the tokens (router-side) hash.
+    statuses = [(s.block_hash, s.status) for s in result.per_block_status]
+    assert statuses == [(11, "live"), (22, "live"), (33, "missing")]
+    # Slot/byte_offset derived from the FakeKv's slot returns, which are
+    # bound to kv-side hashes, not tokens-side.
+    assert [d.byte_offset for d in result.descriptors] == [
+        5 * BLOCK_SIZE_BYTES,
+        9 * BLOCK_SIZE_BYTES,
+    ]
+
+
 def test_remote_plan_parser_truncates_prefix_to_hash_count():
     parsed = RemoteKvReusePlan.from_dict(_plan(planned_prefix_blocks=10))
 
