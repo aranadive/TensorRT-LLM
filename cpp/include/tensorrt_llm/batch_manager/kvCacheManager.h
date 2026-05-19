@@ -1108,6 +1108,14 @@ public:
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
+    //! \brief Find a tree-attached block by its content hash.
+    //! \details Returns std::nullopt if no live block in this window currently caches
+    //! the requested hash. The result reports the block's (block_id, slot_idx,
+    //! cache_level) at the moment of the call; subsequent offload/onboard can change
+    //! slot/level for the same block_id.
+    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
+    findBlockByHash(size_t blockHash);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1653,6 +1661,17 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
     }
 
+    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
+    findBlockByHash(size_t blockHash, SizeType32 windowSize)
+    {
+        auto it = mWindowBlockManagers.find(windowSize);
+        if (it == mWindowBlockManagers.end())
+        {
+            return std::nullopt;
+        }
+        return it->second.findBlockByHash(blockHash);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -2016,6 +2035,10 @@ public:
 
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
+        = 0;
+
+    [[nodiscard]] virtual std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
+    findBlockByHash(size_t blockHash, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2396,6 +2419,12 @@ public:
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
+    }
+
+    std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>> findBlockByHash(
+        size_t blockHash, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlockByHash(blockHash, windowSize);
     }
 
     void resetReuseState() override
