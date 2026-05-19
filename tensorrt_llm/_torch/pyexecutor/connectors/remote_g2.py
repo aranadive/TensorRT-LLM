@@ -193,6 +193,21 @@ class TargetRemotePlanStore:
             )
         except (TypeError, ValueError):
             return None
+        # PROBE: confirm the target worker received the plan and parsed the
+        # new kv_block_hashes field from the wire. Investigation-only.
+        import logging as _logging
+        _logging.warning(
+            "PROBE target_received_plan: plan_id=%s source=%s/%s target=%s/%s "
+            "block_hashes_count=%d kv_block_hashes_count=%d kv_block_hashes_head=%s",
+            parsed.plan_id,
+            parsed.source_worker_id,
+            parsed.source_dp_rank,
+            parsed.target_worker_id,
+            parsed.target_dp_rank,
+            len(parsed.block_hashes),
+            len(parsed.kv_block_hashes),
+            list(parsed.kv_block_hashes[:5]),
+        )
         now_ms = self._clock_ms()
         if not parsed.is_remote_g2() or parsed.is_expired(now_ms):
             return None
