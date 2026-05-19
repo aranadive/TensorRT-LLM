@@ -74,6 +74,14 @@ class RemoteKvReusePlan:
     created_at_ms: int
     expires_at_ms: int
     plan_version: int = REMOTE_KV_REUSE_PLAN_VERSION
+    # Parallel to `block_hashes`, but carrying the source worker's
+    # KV-cache-manager-side hash (TRT-LLM splitmix) rather than the
+    # router-side hash (XXH3 tokens_hash). The source side uses these
+    # values to look up blocks; the router-side block_hashes are kept
+    # for plan identity. Empty when the producer has not been updated
+    # to populate the new field — in that case the source side falls
+    # back to using `block_hashes` for the lookup (legacy behavior).
+    kv_block_hashes: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RemoteKvReusePlan":
@@ -100,6 +108,12 @@ class RemoteKvReusePlan:
             raise ValueError(f"remote G2 plan missing fields: {sorted(missing)}")
 
         block_hashes = tuple(int(block_hash) for block_hash in data["block_hashes"])
+        kv_block_hashes_raw = data.get("kv_block_hashes", ())
+        kv_block_hashes = tuple(int(h) for h in kv_block_hashes_raw)
+        if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):
+            raise ValueError(
+                "kv_block_hashes length must match block_hashes when provided"
+            )
         planned_prefix_blocks = int(data["planned_prefix_blocks"])
         if planned_prefix_blocks < 0:
             raise ValueError("planned_prefix_blocks must be non-negative")
@@ -116,6 +130,7 @@ class RemoteKvReusePlan:
             source_dp_rank=int(data["source_dp_rank"]),
             source_tier=str(data["source_tier"]),
             block_hashes=block_hashes,
+            kv_block_hashes=kv_block_hashes,
             start_block_index=start_block_index,
             planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
             block_size_tokens=int(data["block_size_tokens"]),
@@ -133,6 +148,10 @@ class RemoteKvReusePlan:
     @property
     def planned_hashes(self) -> tuple[int, ...]:
         return self.block_hashes[: self.planned_prefix_blocks]
+
+    @property
+    def planned_kv_block_hashes(self) -> tuple[int, ...]:
+        return self.kv_block_hashes[: self.planned_prefix_blocks]
 
 
 @dataclass
@@ -845,21 +864,29 @@ class SourceG2DescriptorRegistry:
                 None, (), 0, "missing_trtllm_pin_hook", self.source_generation
             )
 
+        identity_hashes = parsed.planned_hashes
+        # Producers that have not been updated to populate kv_block_hashes
+        # leave the field empty, in which case we use the plan's
+        # block_hashes for both identity and lookup. This preserves the
+        # pre-dual-hash behavior for legacy plans.
+        kv_hashes = parsed.planned_kv_block_hashes or identity_hashes
+
         with self._lock:
             records: list[SourceG2DescriptorRecord] = []
             per_block_status: list[RemoteG2BlockStatus] = []
-            for block_hash in parsed.planned_hashes:
-                record = self._records.get(int(block_hash))
+            for i, identity_hash in enumerate(identity_hashes):
+                kv_hash = int(kv_hashes[i])
+                record = self._records.get(kv_hash)
                 if record is None and self._kv is not None:
-                    record = self._lookup_via_find_block_by_hash(int(block_hash))
+                    record = self._lookup_via_find_block_by_hash(kv_hash)
                 if record is None:
-                    per_block_status.append(RemoteG2BlockStatus(int(block_hash), "missing"))
+                    per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "missing"))
                     break
                 if not record.live:
-                    per_block_status.append(RemoteG2BlockStatus(int(block_hash), "non_live"))
+                    per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "non_live"))
                     break
                 if not _is_remote_g2_tier(record.tier):
-                    per_block_status.append(RemoteG2BlockStatus(int(block_hash), "wrong_tier"))
+                    per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "wrong_tier"))
                     break
                 if (
                     record.source_worker_id != self.source_worker_id
@@ -867,14 +894,14 @@ class SourceG2DescriptorRegistry:
                 ):
                     per_block_status.append(
                         RemoteG2BlockStatus(
-                            int(block_hash), "wrong_source", record.descriptor_generation
+                            int(identity_hash), "wrong_source", record.descriptor_generation
                         )
                     )
                     break
                 records.append(record)
                 per_block_status.append(
                     RemoteG2BlockStatus(
-                        int(block_hash), "live", record.descriptor_generation
+                        int(identity_hash), "live", record.descriptor_generation
                     )
                 )
 
@@ -916,16 +943,19 @@ class SourceG2DescriptorRegistry:
                     self._release_pin_ref(pin_ref)
                 raise
 
+            # Descriptors carry the router-facing identity (block_hashes /
+            # tokens_hash). The record's internal block_hash is the KV-side
+            # value used for in-process lookup; the router does not need it.
             descriptors = tuple(
                 RemoteG2Descriptor(
-                    block_hash=record.block_hash,
+                    block_hash=int(identity_hashes[i]),
                     descriptor_generation=record.descriptor_generation,
                     pool_id=record.pool_id,
                     byte_offset=record.byte_offset,
                     byte_length=record.byte_length,
                     metadata=dict(record.metadata),
                 )
-                for record in records
+                for i, record in enumerate(records)
             )
             return RemoteG2ResolveResult(
                 lease_id=lease_id,
