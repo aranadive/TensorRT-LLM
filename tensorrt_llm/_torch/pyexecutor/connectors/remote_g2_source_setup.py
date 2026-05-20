@@ -26,6 +26,41 @@ from .remote_g2 import SourceG2DescriptorRegistry
 from .remote_g2_source_adapter import make_kv_pin_callbacks
 
 
+def _result_to_dict(result: Any) -> dict:
+    """Convert a RemoteG2ResolveResult dataclass into a plain dict for
+    wire transport. The dynamo parent and downstream consumers see only
+    dicts and do not need to import RemoteG2ResolveResult / its nested
+    types.
+    """
+    descriptors = [
+        {
+            "block_hash": d.block_hash,
+            "descriptor_generation": d.descriptor_generation,
+            "pool_id": d.pool_id,
+            "byte_offset": d.byte_offset,
+            "byte_length": d.byte_length,
+            "metadata": dict(d.metadata or {}),
+        }
+        for d in (result.descriptors or ())
+    ]
+    per_block_status = [
+        {
+            "block_hash": s.block_hash,
+            "status": s.status,
+            "descriptor_generation": s.descriptor_generation,
+        }
+        for s in (result.per_block_status or ())
+    ]
+    return {
+        "lease_id": result.lease_id,
+        "descriptors": descriptors,
+        "num_tokens": result.num_tokens,
+        "reason": result.reason,
+        "source_generation": result.source_generation,
+        "per_block_status": per_block_status,
+    }
+
+
 def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int) -> str:
     """Start a ZMQ REP daemon thread bound to a Unix domain socket
     tagged with the dynamo parent's PID. The dynamo parent process
@@ -62,7 +97,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 payload = req.get("payload") or {}
                 if method == "resolve_and_lease":
                     result = registry.resolve_and_lease(payload.get("plan"))
-                    response = {"ok": True, "result": result}
+                    response = {"ok": True, "result": _result_to_dict(result)}
                 elif method == "release_lease":
                     completed = registry.release_lease(
                         payload["lease_id"], payload.get("reason", "ack")
