@@ -767,6 +767,24 @@ class PyExecutor:
                     "transfer for those layers.")
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+            # Start the remote-G2 source-side service here, in the engine
+            # subprocess where kv_cache_manager is directly reachable. The
+            # service is a no-op when remote-G2 is not configured (gated on
+            # the DYNAMO_REMOTE_G2_WORKER_ID env var supplied by the dynamo
+            # parent process). Independent of the connector worker, so the
+            # connector class stays unchanged.
+            # TODO production: feature-gate via connector config rather than
+            # unconditionally calling here.
+            try:
+                from .connectors.remote_g2_source_setup import (
+                    maybe_start_remote_g2_service,
+                )
+                maybe_start_remote_g2_service(self.kv_cache_manager)
+            except Exception:
+                import logging
+                logging.exception(
+                    "remote_g2: service bootstrap raised; continuing"
+                )
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
