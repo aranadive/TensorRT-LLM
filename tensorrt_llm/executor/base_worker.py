@@ -418,6 +418,13 @@ class BaseWorker(GenerationExecutor):
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
         assert request.id is not None
+        # Capture remote_g2_plan attribute carried across the proxy→worker
+        # IpcQueue. We can't put it into the worker's plan store yet because
+        # the connector reads by the C++ runtime request_id (returned by
+        # engine.enqueue_request), not by the proxy-side client_id. So we
+        # stash the plan locally and put it just before returning the
+        # runtime id at the bottom of this function.
+        _remote_g2_plan = getattr(request, "remote_g2_plan", None)
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
@@ -645,6 +652,15 @@ class BaseWorker(GenerationExecutor):
                         executor_request, result_wait_queue=result_wait_queue)
                 else:
                     req_id = self.engine.enqueue_request(executor_request)
+            # Re-key the remote-G2 plan by the C++ runtime request_id. The
+            # parent's plan store was keyed by client_id (request.id); the
+            # connector running inside this engine subprocess reads by the
+            # C++ runtime id (LlmRequest.request_id == req_id here).
+            if _remote_g2_plan is not None:
+                from .._torch.pyexecutor.connectors.remote_g2 import (
+                    target_remote_g2_plan_store,
+                )
+                target_remote_g2_plan_store().put(req_id, _remote_g2_plan)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
