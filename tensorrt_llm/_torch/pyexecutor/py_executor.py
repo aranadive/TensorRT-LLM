@@ -646,6 +646,16 @@ class PyExecutor:
                 logging.exception(
                     "remote_g2: service bootstrap raised; continuing"
                 )
+            try:
+                from .connectors.remote_g2_target_setup import (
+                    maybe_start_remote_g2_target_client,
+                )
+                maybe_start_remote_g2_target_client()
+            except Exception:
+                import logging
+                logging.exception(
+                    "remote_g2: target client bootstrap raised; continuing"
+                )
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
