@@ -37,6 +37,42 @@ def _missing_release_lease(lease_id: str, reason: str) -> bool:
     return False
 
 
+# Module-state slots for callables installed from outside (typically by
+# remote_g2_target_setup.maybe_start_remote_g2_target_client). The
+# connector scheduler/worker read these lazily at call time so that
+# installation order vs. construction order doesn't matter.
+_installed_resolve_and_lease: Optional[
+    Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]
+] = None
+_installed_release_lease: Optional[Callable[[str, str], bool]] = None
+
+
+def install_resolve_and_lease(
+    fn: Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]
+) -> None:
+    global _installed_resolve_and_lease
+    _installed_resolve_and_lease = fn
+
+
+def install_release_lease(fn: Callable[[str, str], bool]) -> None:
+    global _installed_release_lease
+    _installed_release_lease = fn
+
+
+def _resolve_release_lease(explicit: Optional[Callable[[str, str], bool]]):
+    """Return a callable that defers lookup to call time so module-state
+    installation that happens after the scheduler/worker is constructed
+    is still picked up."""
+
+    def _call(lease_id: str, reason: str) -> bool:
+        fn = explicit if explicit is not None else _installed_release_lease
+        if fn is None:
+            return _missing_release_lease(lease_id, reason)
+        return fn(lease_id, reason)
+
+    return _call
+
+
 class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     def __init__(
         self,
@@ -55,28 +91,50 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         self._plan_store = (
             plan_store if plan_store is not None else target_remote_g2_plan_store()
         )
-        self._resolve_and_lease = resolve_and_lease
+        self._explicit_resolve_and_lease = resolve_and_lease
         self._binding_store = (
             binding_store
             if binding_store is not None
             else TargetRemoteG2BindingStore(
-                release_lease or _missing_release_lease,
+                _resolve_release_lease(release_lease),
                 observability=self._observability,
             )
         )
+
+    @property
+    def _resolve_and_lease(
+        self,
+    ) -> Optional[Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]]:
+        """Prefer the explicit kwarg, fall back to module-state install
+        at access time so late installation is still picked up."""
+        if self._explicit_resolve_and_lease is not None:
+            return self._explicit_resolve_and_lease
+        return _installed_resolve_and_lease
 
     def get_num_new_matched_tokens(
         self, request: Any, num_computed_tokens: int
     ) -> tuple[int, bool]:
         plan = self._plan_store.get(request.request_id)
-        if plan is None or self._resolve_and_lease is None:
+        resolver = self._resolve_and_lease
+        import logging as _logging
+        import os as _os
+        _logging.warning(
+            "PROBE rpc_chain get_num_new_matched_tokens pid=%d req_id=%s "
+            "plan_found=%s resolver_set=%s store_id=%d",
+            _os.getpid(),
+            request.request_id,
+            plan is not None,
+            resolver is not None,
+            id(self._plan_store),
+        )
+        if plan is None or resolver is None:
             return (0, False)
 
         record = self._binding_store.resolve_for_request(
             request.request_id,
             plan,
             num_computed_tokens,
-            self._resolve_and_lease,
+            resolver,
         )
         if record is None:
             return (0, False)
@@ -122,7 +180,11 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     ) -> None:
         super().__init__(llm_args)
         self._transfer_adapter = transfer_adapter
-        self._release_lease = release_lease or _missing_release_lease
+        # Lazy resolution of release_lease lets module-state install run
+        # after the worker is constructed (PyExecutor builds the worker
+        # before bootstrap; the parent's REP socket may not be reachable
+        # at that point yet).
+        self._release_lease = _resolve_release_lease(release_lease)
         self._mark_local_valid = mark_local_valid
         self._publish_binding = publish_binding
         self._transfer_timeout_ms = transfer_timeout_ms
