@@ -650,7 +650,7 @@ class PyExecutor:
                 from .connectors.remote_g2_target_setup import (
                     maybe_start_remote_g2_target_client,
                 )
-                maybe_start_remote_g2_target_client()
+                maybe_start_remote_g2_target_client(self.kv_cache_manager)
             except Exception:
                 import logging
                 logging.exception(
