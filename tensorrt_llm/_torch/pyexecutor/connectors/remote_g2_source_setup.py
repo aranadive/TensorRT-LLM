@@ -134,6 +134,57 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                         payload["lease_id"], payload.get("reason", "ack")
                     )
                     response = {"ok": True, "result": completed}
+                elif method == "get_metadata":
+                    bundle = get_nixl_source_bundle()
+                    if bundle is None:
+                        response = {
+                            "ok": False,
+                            "error": "nixl_source_bundle_not_ready",
+                        }
+                    else:
+                        # Bidirectional peer load (raw NIXL): if the
+                        # caller sent its serialized agent metadata,
+                        # call add_remote_agent on it BEFORE returning
+                        # our own metadata. This is the equivalent of
+                        # the old load_remote_agent_by_connection
+                        # handshake but uses the bytes blob NIXL's raw
+                        # API expects.
+                        import base64 as _b64
+                        peer_metadata_b64 = payload.get("peer_metadata_b64")
+                        if peer_metadata_b64:
+                            try:
+                                peer_bytes = _b64.b64decode(peer_metadata_b64)
+                                loaded_name = bundle.agent.add_remote_agent(peer_bytes)
+                                logging.warning(
+                                    "remote_g2: source add_remote_agent "
+                                    "loaded peer name=%s (bytes=%d)",
+                                    loaded_name, len(peer_bytes),
+                                )
+                            except Exception:
+                                logging.exception(
+                                    "remote_g2: source add_remote_agent failed"
+                                )
+                        response = {
+                            "ok": True,
+                            "result": {
+                                "source_worker_id": registry.source_worker_id,
+                                "source_dp_rank": registry.source_dp_rank,
+                                "source_generation": bundle.source_generation,
+                                "remote_name": bundle.remote_name,
+                                # Raw NIXL agent metadata bytes — target
+                                # passes this to its agent.add_remote_agent
+                                # and uses the rkeys it contains for the
+                                # prepped-flow dlist.
+                                "agent_metadata_b64": _b64.b64encode(
+                                    bundle.agent_desc
+                                ).decode("ascii"),
+                                # Pool extent so target can build a
+                                # block-indexed remote dlist that lines
+                                # up with the source's registered region.
+                                "pool_base_ptr": bundle.pool_base_ptr,
+                                "pool_size_bytes": bundle.pool_size_bytes,
+                            },
+                        }
                 else:
                     response = {"ok": False, "error": f"unknown method: {method!r}"}
             except Exception as exc:
@@ -299,67 +350,37 @@ def _setup_nixl_source_agent(
     pool_size_bytes: int,
     source_worker_id: int,
 ) -> Optional[_NixlSourceBundle]:
-    """Build a NIXL agent on the source side and register the
+    """Build a raw nixl_agent on the source side and register the
     host_pinned secondary pool memory range so it can be read remotely.
 
-    Returns a populated bundle, or ``None`` when the nixl package isn't
-    available or registration fails. Caller logs and continues without
-    NIXL — remote-G2 resolve calls will still succeed (descriptors
-    flow), but no bytes will be moveable until this works.
+    Switched from TRT-LLM's BindingsNixlTransferAgent wrapper to raw
+    `nixl.nixl_agent` because the wrapper exposes only the combined
+    transfer flow (createXferReq → NIXL_ERR_NOT_FOUND for cross-process
+    READ). The prepped flow needed for proper rkey exchange requires
+    raw NIXL API surface.
     """
-    try:
-        from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
-        from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-    except Exception:
-        logging.exception(
-            "remote_g2: NIXL agent imports failed; transfers will not be available"
-        )
-        return None
-
     agent_name = f"remote-g2-source-{source_worker_id}"
-    try:
-        agent = NixlTransferAgent(agent_name)
-    except Exception:
-        logging.exception(
-            "remote_g2: NixlTransferAgent(%s) construction failed", agent_name
-        )
-        return None
+    from .remote_g2_raw_nixl_adapter import build_raw_nixl_source_agent
 
-    # device_id=0 for DRAM is the standard NIXL convention for host
-    # memory regardless of which GPU this worker happens to be on.
-    # The fourth element is a human-readable name for the registration.
-    pool_reg_name = f"remote-g2-host-pool-{source_worker_id}"
-    desc_tuple = (pool_base_ptr, pool_size_bytes, 0, pool_reg_name)
-    try:
-        agent.register_memory(RegMemoryDescs(type="DRAM", descs=[desc_tuple]))
-    except Exception:
-        logging.exception(
-            "remote_g2: register_memory failed for pool at 0x%x size=%d",
-            pool_base_ptr,
-            pool_size_bytes,
-        )
-        return None
-
-    try:
-        agent_desc = agent.get_local_agent_desc()
-    except Exception:
-        logging.exception(
-            "remote_g2: get_local_agent_desc failed for agent %s", agent_name
-        )
-        return None
-
-    if not agent_desc:
-        logging.warning(
-            "remote_g2: agent %s returned empty local agent_desc", agent_name
-        )
-        return None
-
-    return _NixlSourceBundle(
-        agent=agent,
-        remote_name=agent_name,
-        agent_desc=agent_desc,
+    handle = build_raw_nixl_source_agent(
+        agent_name=agent_name,
         pool_base_ptr=pool_base_ptr,
         pool_size_bytes=pool_size_bytes,
+    )
+    if handle is None:
+        return None
+    # build_raw_nixl_source_agent has already constructed the agent,
+    # registered the host_pinned pool, and captured the agent metadata
+    # bytes. Mirror those values into _NixlSourceBundle so the existing
+    # metadata RPC handler can read them via the same field names it
+    # used to use with the TRT-LLM wrapper.
+    return _NixlSourceBundle(
+        agent=handle.agent,
+        remote_name=handle.agent_name,
+        agent_desc=handle.agent_metadata,
+        pool_base_ptr=handle.pool_base_ptr,
+        pool_size_bytes=handle.pool_size_bytes,
+        source_generation=handle.source_generation,
     )
 
 
