@@ -45,6 +45,9 @@ _installed_resolve_and_lease: Optional[
     Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]
 ] = None
 _installed_release_lease: Optional[Callable[[str, str], bool]] = None
+_installed_transfer_adapter: Optional[Any] = None
+_installed_mark_local_valid: Optional[Callable[[RemoteG2BindingRecord], None]] = None
+_installed_publish_binding: Optional[Callable[[RemoteG2BindingRecord], None]] = None
 
 
 def install_resolve_and_lease(
@@ -57,6 +60,24 @@ def install_resolve_and_lease(
 def install_release_lease(fn: Callable[[str, str], bool]) -> None:
     global _installed_release_lease
     _installed_release_lease = fn
+
+
+def install_transfer_adapter(adapter: Any) -> None:
+    """Install the NIXL transfer adapter that the connector worker uses
+    in start_load_kv. Read lazily by the worker so installation order
+    relative to worker construction doesn't matter."""
+    global _installed_transfer_adapter
+    _installed_transfer_adapter = adapter
+
+
+def install_mark_local_valid(fn: Callable[[RemoteG2BindingRecord], None]) -> None:
+    global _installed_mark_local_valid
+    _installed_mark_local_valid = fn
+
+
+def install_publish_binding(fn: Callable[[RemoteG2BindingRecord], None]) -> None:
+    global _installed_publish_binding
+    _installed_publish_binding = fn
 
 
 def _resolve_release_lease(explicit: Optional[Callable[[str, str], bool]]):
@@ -141,23 +162,52 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         return (record.matched_tokens, True)
 
     def update_state_after_alloc(self, request: Any, block_ids: list[int]) -> None:
-        self._binding_store.bind_target_blocks(request.request_id, block_ids)
+        import logging as _logging
+        record_before = self._binding_store.get(request.request_id)
+        result = self._binding_store.bind_target_blocks(request.request_id, block_ids)
+        record_after = self._binding_store.get(request.request_id)
+        _logging.warning(
+            "PROBE rpc_chain update_state_after_alloc req_id=%s block_ids_count=%d "
+            "pre_state=%s post_state=%s post_bound_blocks=%d post_is_transfer_ready=%s",
+            request.request_id,
+            len(block_ids),
+            getattr(record_before, "state", None) if record_before else None,
+            getattr(record_after, "state", None) if record_after else None,
+            len(getattr(record_after, "bound_blocks", ()) or ()) if record_after else 0,
+            getattr(record_after, "is_transfer_ready", False) if record_after else False,
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> RemoteG2ConnectorMetadata:
+        # The official contract is to filter records by what's in
+        # scheduler_output. Empirically that input arrives with the
+        # newly-allocated request missing during the same tick the
+        # request was bound, so the connector would never emit any
+        # transfer-ready record. Scan binding_store directly instead —
+        # is_transfer_ready already gates on (state=BOUND and bound_blocks),
+        # and the worker tracks per-request _active_loads / _completed_loads
+        # to avoid double-start, so we don't actually need scheduler_output
+        # to dedupe.
         bindings: list[RemoteG2BindingRecord] = []
-        seen_request_ids: set[int | str] = set()
-        for request_data in (
-            scheduler_output.new_requests + scheduler_output.cached_requests
-        ):
-            request_id = request_data.request_id
-            if request_id in seen_request_ids:
-                continue
-            seen_request_ids.add(request_id)
-            record = self._binding_store.get(request_id)
-            if record is not None and record.is_transfer_ready:
+        states_snapshot = []
+        for request_id, record in self._binding_store.iter_records():
+            states_snapshot.append((
+                request_id,
+                getattr(record, "state", None),
+                bool(record.is_transfer_ready),
+            ))
+            if record.is_transfer_ready:
                 bindings.append(record)
+        import logging as _logging
+        _logging.warning(
+            "PROBE rpc_chain build_connector_meta scanned=%d transfer_ready=%d states=%s "
+            "scheduler_output_size=%d",
+            len(states_snapshot),
+            len(bindings),
+            states_snapshot[:5],
+            len(scheduler_output.new_requests) + len(scheduler_output.cached_requests),
+        )
         return RemoteG2ConnectorMetadata(tuple(bindings))
 
     def request_finished(self, request: Any, cache_block_ids: list[int]) -> bool:
@@ -179,25 +229,54 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         super().__init__(llm_args)
-        self._transfer_adapter = transfer_adapter
-        # Lazy resolution of release_lease lets module-state install run
-        # after the worker is constructed (PyExecutor builds the worker
-        # before bootstrap; the parent's REP socket may not be reachable
-        # at that point yet).
+        # Worker is constructed by PyExecutor with just llm_args, before
+        # maybe_start_remote_g2_target_client runs - none of the
+        # adapter / hooks can be wired at that point. Stash whatever was
+        # passed explicitly; the accessor properties below fall back to
+        # module-state slots at call time.
+        self._explicit_transfer_adapter = transfer_adapter
         self._release_lease = _resolve_release_lease(release_lease)
-        self._mark_local_valid = mark_local_valid
-        self._publish_binding = publish_binding
+        self._explicit_mark_local_valid = mark_local_valid
+        self._explicit_publish_binding = publish_binding
         self._transfer_timeout_ms = transfer_timeout_ms
         self._observability = observability or NullRemoteG2ObservabilitySink()
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
 
+    @property
+    def _transfer_adapter(self) -> Optional[Any]:
+        if self._explicit_transfer_adapter is not None:
+            return self._explicit_transfer_adapter
+        return _installed_transfer_adapter
+
+    @property
+    def _mark_local_valid(self) -> Optional[Callable[[RemoteG2BindingRecord], None]]:
+        if self._explicit_mark_local_valid is not None:
+            return self._explicit_mark_local_valid
+        return _installed_mark_local_valid
+
+    @property
+    def _publish_binding(self) -> Optional[Callable[[RemoteG2BindingRecord], None]]:
+        if self._explicit_publish_binding is not None:
+            return self._explicit_publish_binding
+        return _installed_publish_binding
+
     def register_kv_caches(self, kv_cache_tensor: Any) -> None:
         self._kv_cache_tensor = kv_cache_tensor
 
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
+        import logging as _logging
+        _logging.warning(
+            "PROBE rpc_chain start_load_kv has_meta=%s bindings_count=%d "
+            "transfer_adapter=%s mark_local_valid=%s publish_binding=%s",
+            isinstance(metadata, RemoteG2ConnectorMetadata),
+            len(metadata.bindings) if isinstance(metadata, RemoteG2ConnectorMetadata) else 0,
+            "WIRED" if self._transfer_adapter is not None else "NONE",
+            "WIRED" if self._mark_local_valid is not None else "NONE",
+            "WIRED" if self._publish_binding is not None else "NONE",
+        )
         if not isinstance(metadata, RemoteG2ConnectorMetadata) or not metadata.bindings:
             return
         if self._transfer_adapter is None:
@@ -243,7 +322,15 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
     ) -> tuple[list[int], list[int]]:
         finished_loading: list[int] = []
-        for request_id in started_loading_req_ids:
+        # Iterate self._active_loads (all in-flight transfers), not just
+        # started_loading_req_ids (NEW this tick). The connector
+        # framework's get_finished moves the request from
+        # new_async_requests to pending_async_requests on the first
+        # tick, so subsequent ticks call us with empty
+        # started_loading_req_ids — without this iteration we'd only
+        # ever poll each transfer ONCE, and slow/in-progress transfers
+        # would never get reported as finished.
+        for request_id in list(self._active_loads.keys()):
             active = self._active_loads.get(request_id)
             if active is None:
                 continue
