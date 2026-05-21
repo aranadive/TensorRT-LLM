@@ -633,6 +633,14 @@ class TargetRemoteG2BindingStore:
         with self._lock:
             return self._records.get(_normalize_request_id(request_id))
 
+    def iter_records(self):
+        """Snapshot of (request_id, record) for all currently-tracked
+        records. Snapshot is taken under the lock; iteration is safe
+        without it. Used by the connector to scan for transfer-ready
+        bindings without relying on the scheduler_output filtering."""
+        with self._lock:
+            return list(self._records.items())
+
     def clear(self) -> None:
         with self._lock:
             records = tuple(self._records.values())
