@@ -20,10 +20,41 @@ import logging
 import os
 import pickle
 import threading
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .remote_g2 import SourceG2DescriptorRegistry
 from .remote_g2_source_adapter import make_kv_pin_callbacks
+
+
+@dataclass
+class _NixlSourceBundle:
+    """Source-side NIXL agent + metadata captured for the metadata RPC.
+
+    `agent` is the live NixlTransferAgent (kept alive for the worker's
+    lifetime — its memory registrations and the daemon polling thread
+    expire when the agent is GCed). `agent_desc` is the opaque
+    bytes-blob other workers' agents need to call `load_remote_agent`.
+    `remote_name` is the agent's identifier used as the third argument
+    to `TransferRequest(..., remote_name)` from a peer.
+    """
+
+    agent: Any
+    remote_name: str
+    agent_desc: bytes
+    pool_base_ptr: int
+    pool_size_bytes: int
+    source_generation: int = 1
+
+
+# Process-wide singleton — populated by maybe_start_remote_g2_service after
+# the NIXL agent is constructed, read by the ZMQ REP loop when answering
+# get_metadata RPCs (Stage T2).
+_GLOBAL_NIXL_SOURCE_BUNDLE: Optional[_NixlSourceBundle] = None
+
+
+def get_nixl_source_bundle() -> Optional[_NixlSourceBundle]:
+    return _GLOBAL_NIXL_SOURCE_BUNDLE
 
 
 def _result_to_dict(result: Any) -> dict:
@@ -249,6 +280,89 @@ def _derive_window_size(kv: Any) -> Optional[int]:
         return None
 
 
+def _pool_size_bytes(kv: Any) -> Optional[int]:
+    """Total byte size of the host_pinned secondary pool — element_size *
+    numel of the tensor returned by C++ `get_secondary_pool_data(0)`. We
+    register this whole range with the NIXL agent so remote workers can
+    issue READs against any slot in it."""
+    try:
+        pool = kv.get_secondary_pool_data(0)
+    except Exception:
+        return None
+    if pool is None or pool.numel() == 0:
+        return None
+    return int(pool.element_size() * pool.numel())
+
+
+def _setup_nixl_source_agent(
+    pool_base_ptr: int,
+    pool_size_bytes: int,
+    source_worker_id: int,
+) -> Optional[_NixlSourceBundle]:
+    """Build a NIXL agent on the source side and register the
+    host_pinned secondary pool memory range so it can be read remotely.
+
+    Returns a populated bundle, or ``None`` when the nixl package isn't
+    available or registration fails. Caller logs and continues without
+    NIXL — remote-G2 resolve calls will still succeed (descriptors
+    flow), but no bytes will be moveable until this works.
+    """
+    try:
+        from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
+        from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+    except Exception:
+        logging.exception(
+            "remote_g2: NIXL agent imports failed; transfers will not be available"
+        )
+        return None
+
+    agent_name = f"remote-g2-source-{source_worker_id}"
+    try:
+        agent = NixlTransferAgent(agent_name)
+    except Exception:
+        logging.exception(
+            "remote_g2: NixlTransferAgent(%s) construction failed", agent_name
+        )
+        return None
+
+    # device_id=0 for DRAM is the standard NIXL convention for host
+    # memory regardless of which GPU this worker happens to be on.
+    # The fourth element is a human-readable name for the registration.
+    pool_reg_name = f"remote-g2-host-pool-{source_worker_id}"
+    desc_tuple = (pool_base_ptr, pool_size_bytes, 0, pool_reg_name)
+    try:
+        agent.register_memory(RegMemoryDescs(type="DRAM", descs=[desc_tuple]))
+    except Exception:
+        logging.exception(
+            "remote_g2: register_memory failed for pool at 0x%x size=%d",
+            pool_base_ptr,
+            pool_size_bytes,
+        )
+        return None
+
+    try:
+        agent_desc = agent.get_local_agent_desc()
+    except Exception:
+        logging.exception(
+            "remote_g2: get_local_agent_desc failed for agent %s", agent_name
+        )
+        return None
+
+    if not agent_desc:
+        logging.warning(
+            "remote_g2: agent %s returned empty local agent_desc", agent_name
+        )
+        return None
+
+    return _NixlSourceBundle(
+        agent=agent,
+        remote_name=agent_name,
+        agent_desc=agent_desc,
+        pool_base_ptr=pool_base_ptr,
+        pool_size_bytes=pool_size_bytes,
+    )
+
+
 def maybe_start_remote_g2_service(
     kv: Any,
     *,
@@ -360,5 +474,38 @@ def maybe_start_remote_g2_service(
             "remote_g2: failed to start ZMQ REP service; registry built but "
             "not reachable from dynamo parent"
         )
+
+    # Stage T1 — bootstrap the NIXL agent and register the host_pinned
+    # secondary pool. The bundle is stashed as a process-wide singleton
+    # so the ZMQ REP service can answer the get_metadata RPC (Stage T2)
+    # without threading the bundle through the registry constructor.
+    pool_size_bytes = _pool_size_bytes(kv)
+    if not pool_size_bytes or pool_size_bytes <= 0:
+        logging.warning(
+            "remote_g2: NIXL agent skipped (pool_size_bytes unknown)"
+        )
+    else:
+        bundle = _setup_nixl_source_agent(
+            pool_base_ptr=pool_base_ptr,
+            pool_size_bytes=pool_size_bytes,
+            source_worker_id=source_worker_id,
+        )
+        if bundle is not None:
+            global _GLOBAL_NIXL_SOURCE_BUNDLE
+            _GLOBAL_NIXL_SOURCE_BUNDLE = bundle
+            logging.warning(
+                "PROBE remote_g2_source_nixl: agent_name=%s pool_base_ptr=0x%x "
+                "pool_size=%d agent_desc_bytes=%d source_generation=%d",
+                bundle.remote_name,
+                bundle.pool_base_ptr,
+                bundle.pool_size_bytes,
+                len(bundle.agent_desc),
+                bundle.source_generation,
+            )
+        else:
+            logging.warning(
+                "remote_g2: NIXL source agent bootstrap failed; "
+                "resolve will still work, but transfer is disabled"
+            )
 
     return registry
