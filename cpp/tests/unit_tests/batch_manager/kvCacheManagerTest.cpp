@@ -4816,10 +4816,11 @@ TEST_F(KVCacheManagerTest, GetPrimaryAndSecondaryPool)
     }
 }
 
-// Verifies that findBlockByHash returns the current (block_id, slot, cache_level)
-// for a tree-attached block, std::nullopt for an unknown hash, and reflects the
-// post-offload location for blocks that have migrated to secondary.
-TEST_F(KVCacheManagerTest, FindBlockByHashReturnsCurrentLocation)
+// Verifies that findAndPinSecondaryBlockByHash returns std::nullopt for primary-only
+// blocks (intentional — the API is secondary-only), succeeds for blocks that have
+// been offloaded to secondary, atomically pins the matched block, and returns
+// std::nullopt for unknown hashes / wrong windows.
+TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSecondary)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
     auto constexpr numLayers = 2;
@@ -4827,7 +4828,7 @@ TEST_F(KVCacheManagerTest, FindBlockByHashReturnsCurrentLocation)
     auto constexpr sizePerHead = 16;
     auto constexpr tokensPerBlock = 4;
     auto constexpr blocksInPrimaryPool = 4;
-    auto constexpr blocksInSecondaryPool = 2;
+    auto constexpr blocksInSecondaryPool = 4;
     auto constexpr maxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr beamWidth = 1;
@@ -4850,33 +4851,67 @@ TEST_F(KVCacheManagerTest, FindBlockByHashReturnsCurrentLocation)
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     kvCacheManager.storeContextBlocks(*llmRequest);
 
-    // Capture the stored block_ids and their hashes from the request's cache
-    // block ids — we don't know the hash values up front (they're token-derived).
     auto const& blockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
     ASSERT_GE(blockIds.size(), 1);
-
-    // Find each stored block by its hash, retrieved via the block's own getHash().
     auto& blockManager = kvCacheManager.getBlockManager();
+
+    // Blocks are currently primary-only — find_and_pin must skip them all.
     for (auto bid : blockIds)
     {
         auto block = blockManager.getBlockById(bid, maxAttentionWindow);
         ASSERT_NE(block, nullptr);
-        size_t blockHash = block->getHash();
-
-        auto result = kvCacheManager.findBlockByHash(blockHash, maxAttentionWindow);
-        ASSERT_TRUE(result.has_value()) << "hash should be findable for block_id=" << bid;
-        auto [foundBlockId, slotIdx, cacheLevel] = *result;
-        EXPECT_EQ(foundBlockId, bid);
-        EXPECT_GE(slotIdx, 0);
-        EXPECT_EQ(cacheLevel, 0); // primary after store
+        auto result = kvCacheManager.findAndPinSecondaryBlockByHash(block->getHash(), maxAttentionWindow);
+        EXPECT_FALSE(result.has_value())
+            << "primary-only block " << bid << " must NOT be returned by secondary-only lookup";
     }
 
+    // Force the stored blocks to migrate to secondary by allocating more primary
+    // blocks than the primary pool can hold; the eviction policy will offload.
+    {
+        LlmRequest::RequestIdType pressureId{1};
+        auto pressureTokens = std::make_shared<VecTokens>(
+            VecTokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25});
+        auto pressureRequest
+            = std::make_shared<LlmRequest>(pressureId, 0, pressureTokens, samplingConfig, isStreaming);
+        kvCacheManager.addSequenceBatch(
+            {{{pressureId, static_cast<SizeType32>(pressureTokens->size()), beamWidth}}},
+            {std::ref(*pressureRequest)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*pressureRequest);
+        kvCacheManager.storeContextBlocks(*pressureRequest);
+    }
+
+    // Now at least some of the original blocks should have migrated to secondary.
+    // The new API should find + pin them and return (block_id, post-pin slot).
+    std::vector<KVCacheBlock::IdType> pinnedIds;
+    for (auto bid : blockIds)
+    {
+        auto block = blockManager.getBlockById(bid, maxAttentionWindow);
+        if (block == nullptr || block->isPrimary())
+        {
+            continue;
+        }
+        size_t blockHash = block->getHash();
+        auto result = kvCacheManager.findAndPinSecondaryBlockByHash(blockHash, maxAttentionWindow);
+        ASSERT_TRUE(result.has_value()) << "secondary block " << bid << " should be findable";
+        auto [foundBlockId, slotIdx] = *result;
+        EXPECT_EQ(foundBlockId, bid);
+        EXPECT_GE(slotIdx, 0);
+        EXPECT_TRUE(block->hasRefs()) << "block " << bid << " must be pinned by find_and_pin";
+        pinnedIds.push_back(foundBlockId);
+    }
+    ASSERT_FALSE(pinnedIds.empty())
+        << "no blocks migrated to secondary — pressure workload did not evict, test is "
+           "ineffective; check blocksInPrimaryPool and pressure size";
+
+    // Unpin to leave a clean state for subsequent tests.
+    kvCacheManager.unpinBlocksById(pinnedIds);
+
     // Unknown hash returns nullopt.
-    auto missing = kvCacheManager.findBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow);
+    auto missing = kvCacheManager.findAndPinSecondaryBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow);
     EXPECT_FALSE(missing.has_value());
 
     // Unknown window returns nullopt (empty optional, not a crash).
-    auto wrongWindow = kvCacheManager.findBlockByHash(0, maxAttentionWindow + 1);
+    auto wrongWindow = kvCacheManager.findAndPinSecondaryBlockByHash(0, maxAttentionWindow + 1);
     EXPECT_FALSE(wrongWindow.has_value());
 }
 

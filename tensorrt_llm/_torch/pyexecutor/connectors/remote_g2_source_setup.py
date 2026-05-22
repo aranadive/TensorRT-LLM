@@ -4,7 +4,7 @@
 """Bootstrap the source-side SourceG2DescriptorRegistry from inside the
 engine subprocess.
 
-The KV cache manager (and the C++ APIs we depend on — find_block_by_hash,
+The KV cache manager (and the C++ APIs we depend on — find_and_pin_secondary_block_by_hash,
 pin_blocks_by_id, get_secondary_pool_data) only exists in the engine
 subprocess that PyExecutor runs in. So the registry has to be built there.
 The connector worker's register_kv_caches hook is the natural anchor: it
@@ -420,7 +420,7 @@ def maybe_start_remote_g2_service(
 
     # PyExecutor.kv_cache_manager is a Python wrapper class
     # (resource_manager.KVCacheManager); the C++ binding with
-    # get_secondary_pool_data / find_block_by_hash / pin_blocks_by_id
+    # get_secondary_pool_data / find_and_pin_secondary_block_by_hash / pin_blocks_by_id
     # sits at .impl. Unwrap once so the rest of the code (and the
     # SourceG2DescriptorRegistry it builds) talks to the C++ object
     # directly.

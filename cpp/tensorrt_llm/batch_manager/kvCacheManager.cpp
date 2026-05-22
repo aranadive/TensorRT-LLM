@@ -2037,12 +2037,9 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     return searchReuseTree(blockKeys);
 }
 
-std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>> WindowBlockManager::findBlockByHash(
+std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> WindowBlockManager::findAndPinSecondaryBlockByHash(
     size_t blockHash)
 {
-    static constexpr SizeType32 kPrimaryLevel = 0;
-    static constexpr SizeType32 kSecondaryLevel = 1;
-
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     for (auto const& block : mAllBlocksById)
     {
@@ -2063,8 +2060,35 @@ std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>> WindowBl
         {
             continue;
         }
-        return std::make_tuple(block->getBlockId(), block->getMemoryPoolBlockIndex(),
-            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel);
+        // remote-G2 transfer is host-pool-only. A primary VRAM match is intentionally
+        // skipped — pinning it would steal blocks from the inference engine and the
+        // adapter would reject it anyway.
+        if (block->isPrimary())
+        {
+            continue;
+        }
+
+        // Atomic pin (claim from free queue + refcount bump) under the lookup mutex,
+        // mirroring pinBlocksById's body but inlined here so the bump cannot race
+        // against an eviction that observes the block momentarily unpinned.
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+        }
+        block->incRefCount();
+
+        // Capture the post-pin slot AFTER refcount bump and BEFORE releasing the
+        // lookup mutex so the returned slot cannot diverge from the held pin.
+        auto const slotIdx = block->getMemoryPoolBlockIndex();
+
+        // CPU-side wait for any in-flight offload DMA targeting this slot. The
+        // lookup-tree → secondary-slot pointer is committed at offload() time, but
+        // the actual primary→secondary copy is queued on the offload stream and
+        // not yet visible to a NIXL/RDMA reader. Without this sync, the network
+        // adapter would pull the slot's pre-offload contents.
+        mTransferManager->waitForPendingWrite(slotIdx);
+
+        return std::make_tuple(block->getBlockId(), slotIdx);
     }
     return std::nullopt;
 }

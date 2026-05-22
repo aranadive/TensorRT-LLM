@@ -1108,13 +1108,27 @@ public:
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
-    //! \brief Find a tree-attached block by its content hash.
-    //! \details Returns std::nullopt if no live block in this window currently caches
-    //! the requested hash. The result reports the block's (block_id, slot_idx,
-    //! cache_level) at the moment of the call; subsequent offload/onboard can change
-    //! slot/level for the same block_id.
-    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
-    findBlockByHash(size_t blockHash);
+    //! \brief Atomic find-and-pin of a tree-attached SECONDARY (host-pool) block by its
+    //! content hash. Primary blocks are intentionally skipped: pinning a primary VRAM
+    //! block would steal it from the inference engine, and the remote-G2 transfer
+    //! path is host-pool-only by design.
+    //!
+    //! Returns std::nullopt if no live secondary block in this window currently caches
+    //! the requested hash. On success, returns (block_id, post-pin slot_idx) and the
+    //! block's refcount has been bumped (caller MUST call unpinBlocksById once done).
+    //!
+    //! \details Three races this method intentionally closes:
+    //!   1. find-then-pin: lookup walk and refcount bump happen under the same
+    //!      lookupTree mutex, so the block found cannot be evicted before being pinned.
+    //!   2. swap-before-DMA-commit: after a primary→secondary offload, the lookup
+    //!      tree's hash→slot pointer is updated immediately but the underlying DMA
+    //!      copy is queued on the offload stream and may not be visible to a NIXL
+    //!      reader. This method waits on mPendingWrites[slot] before returning, so
+    //!      the caller sees committed bytes.
+    //!   3. tier flip: by restricting to secondary blocks, we avoid the case where a
+    //!      block found in primary gets demoted to secondary mid-transfer.
+    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
+    findAndPinSecondaryBlockByHash(size_t blockHash);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -1661,15 +1675,15 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
     }
 
-    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
-    findBlockByHash(size_t blockHash, SizeType32 windowSize)
+    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
+    findAndPinSecondaryBlockByHash(size_t blockHash, SizeType32 windowSize)
     {
         auto it = mWindowBlockManagers.find(windowSize);
         if (it == mWindowBlockManagers.end())
         {
             return std::nullopt;
         }
-        return it->second.findBlockByHash(blockHash);
+        return it->second.findAndPinSecondaryBlockByHash(blockHash);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -2037,8 +2051,8 @@ public:
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
-    [[nodiscard]] virtual std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>>
-    findBlockByHash(size_t blockHash, SizeType32 windowSize)
+    [[nodiscard]] virtual std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
+    findAndPinSecondaryBlockByHash(size_t blockHash, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2421,10 +2435,10 @@ public:
         return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
-    std::optional<std::tuple<KVCacheBlock::IdType, SizeType32, SizeType32>> findBlockByHash(
+    std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> findAndPinSecondaryBlockByHash(
         size_t blockHash, SizeType32 windowSize) override
     {
-        return mBlockManager.findBlockByHash(blockHash, windowSize);
+        return mBlockManager.findAndPinSecondaryBlockByHash(blockHash, windowSize);
     }
 
     void resetReuseState() override

@@ -320,28 +320,30 @@ def test_source_registry_reports_first_missing_block_status():
     assert result.per_block_status[0].status == "missing"
 
 
-def test_source_registry_falls_back_to_find_block_by_hash_when_kv_provided():
+def test_source_registry_falls_back_to_find_and_pin_secondary_when_kv_provided():
     # When the in-memory _records cache is empty and a kv handle is
     # configured, resolve_and_lease should discover blocks via
-    # kv.find_block_by_hash and synthesize ephemeral records whose
-    # byte_offset and nixl_memory_desc.ptr are derived from the
-    # returned slot and the pool's base pointer.
+    # kv.find_and_pin_secondary_block_by_hash and synthesize ephemeral
+    # records whose byte_offset and nixl_memory_desc.ptr are derived
+    # from the returned slot and the pool's base pointer. The C++ call
+    # atomically pins each block under the lookup mutex (post-pin slot
+    # in the returned tuple), so the resolve-time acquire_pin sees the
+    # _pinned_by_lookup flag and skips double-pinning.
 
     BLOCK_SIZE_BYTES = 4096
     POOL_BASE_PTR = 0x1000_0000
     WINDOW_SIZE = 4096
-    PRIMARY_LEVEL = 0
-    SECONDARY_LEVEL = 1
     locations = {
-        11: (42, 5, SECONDARY_LEVEL),
-        22: (88, 9, SECONDARY_LEVEL),
+        # (block_id, post_pin_slot) — no level: the new API is secondary-only.
+        11: (42, 5),
+        22: (88, 9),
     }
     lookups: list[tuple[int, int]] = []
     pins: list[tuple[int, int]] = []
     unpinned: list[int] = []
 
     class FakeKv:
-        def find_block_by_hash(self, block_hash, window_size):
+        def find_and_pin_secondary_block_by_hash(self, block_hash, window_size):
             lookups.append((int(block_hash), int(window_size)))
             return locations.get(int(block_hash))
 
@@ -423,14 +425,15 @@ def test_source_registry_uses_kv_block_hashes_for_lookup_when_present():
     tokens_hashes = [11, 22, 33]
     kv_hashes = [0xAAAA_AAAA_AAAA_AAA1, 0xBBBB_BBBB_BBBB_BBB2, 0xCCCC_CCCC_CCCC_CCC3]
     locations = {
-        kv_hashes[0]: (42, 5, SECONDARY_LEVEL),
-        kv_hashes[1]: (88, 9, SECONDARY_LEVEL),
+        # (block_id, post_pin_slot) — secondary-only API.
+        kv_hashes[0]: (42, 5),
+        kv_hashes[1]: (88, 9),
         # kv_hashes[2] intentionally absent — last block is "missing"
     }
     lookups: list[int] = []
 
     class FakeKv:
-        def find_block_by_hash(self, block_hash, window_size):
+        def find_and_pin_secondary_block_by_hash(self, block_hash, window_size):
             lookups.append(int(block_hash))
             return locations.get(int(block_hash))
 
@@ -459,7 +462,7 @@ def test_source_registry_uses_kv_block_hashes_for_lookup_when_present():
     assert result.num_tokens == 2 * 16
     # The descriptors must carry tokens hashes so the router can correlate.
     assert [d.block_hash for d in result.descriptors] == [11, 22]
-    # The kv-side hashes are the ones used against kv.find_block_by_hash.
+    # The kv-side hashes are the ones used against kv.find_and_pin_secondary_block_by_hash.
     assert lookups == kv_hashes
     # Per-block status reports the tokens (router-side) hash.
     statuses = [(s.block_hash, s.status) for s in result.per_block_status]
