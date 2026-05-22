@@ -294,6 +294,9 @@ class SourceG2DescriptorRecord:
     live: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
     lease_count: int = 0
+    # True when find_and_pin_secondary_block_by_hash already bumped refcount on
+    # this block; the resolve-time acquire_pin should not pin again.
+    _pinned_by_lookup: bool = False
 
     def is_resolvable_for(self, source_worker_id: int, source_dp_rank: int) -> bool:
         return (
@@ -1031,23 +1034,30 @@ class SourceG2DescriptorRegistry:
     def _lookup_via_find_block_by_hash(
         self, block_hash: int
     ) -> Optional[SourceG2DescriptorRecord]:
-        """Resolve a block by hash through the C++ KV cache manager and
-        synthesize an ephemeral descriptor record. The slot read here is
-        not authoritative — the downstream acquire_pin callback pins the
-        block and re-anchors byte_offset / nixl_memory_desc.ptr to the
-        actual post-pin slot before the lease is committed.
+        """Resolve a block by hash through the C++ KV cache manager via the
+        atomic find_and_pin_secondary_block_by_hash API. The returned record
+        is anchored to the POST-PIN slot, and the underlying C++ call has
+        already pinned the block + waited for any in-flight offload DMA to
+        commit. The downstream acquire_pin path must only register the pin
+        with the lease (NOT pin again), and the lease release must unpin it.
+
+        Returns None if no live secondary block in this window currently
+        caches the requested hash. Returning None correctly steers the caller
+        away from remote-G2 reuse (target falls back to local prefill).
         """
         if self._window_size is None or self._block_size_bytes <= 0:
             return None
         try:
-            loc = self._kv.find_block_by_hash(block_hash, int(self._window_size))
+            loc = self._kv.find_and_pin_secondary_block_by_hash(
+                block_hash, int(self._window_size)
+            )
         except Exception:
             return None
         if loc is None:
             return None
-        block_id, slot_idx, _level = loc
+        block_id, slot_idx = loc
         byte_offset = int(slot_idx) * self._block_size_bytes
-        return SourceG2DescriptorRecord(
+        record = SourceG2DescriptorRecord(
             block_hash=block_hash,
             source_worker_id=self.source_worker_id,
             source_dp_rank=self.source_dp_rank,
@@ -1065,3 +1075,9 @@ class SourceG2DescriptorRegistry:
                 }
             },
         )
+        # The C++ atomic find+pin already bumped refcount on this block. The
+        # downstream acquire_pin callback must NOT call pin_blocks_by_id again
+        # — it should only register this pin with the lease so release_lease
+        # can unpin once the transfer completes.
+        record._pinned_by_lookup = True
+        return record

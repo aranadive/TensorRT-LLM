@@ -80,6 +80,17 @@ public:
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
+    //! \brief CPU-side block until any pending offload DMA write to the given memory-pool slot
+    //! has committed.
+    //! \details Offload DMAs are queued asynchronously on mOffloadManager's stream and the
+    //! corresponding tr::CudaEvent is stashed in mPendingWrites at offload() time. Code paths
+    //! that read the destination slot OUTSIDE of any CUDA stream — notably NIXL/RDMA-driven
+    //! cross-process reads of host-pinned secondary blocks — must call this before reading,
+    //! otherwise the network adapter can pull the slot's pre-offload (stale) contents.
+    //! No-op when there is no pending write for the slot. The pending-write entry is erased
+    //! on successful synchronization so subsequent callers do not pay the cost again.
+    void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx);
+
 private:
     friend class ::tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
 
