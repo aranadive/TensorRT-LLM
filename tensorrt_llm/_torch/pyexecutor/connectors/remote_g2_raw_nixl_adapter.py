@@ -357,7 +357,13 @@ class RawNixlRemoteG2Adapter:
         local_indices: list[int] = []
         remote_indices: list[int] = []
         for block in record.bound_blocks:
-            local_indices.append(int(block.target_block_id))
+            # Use the primary-pool slot index (resolved at bind time) — NIXL's
+            # local dlist is dense over slots; block_ids are globally-unique
+            # engine identifiers that can exceed the slot count.
+            slot_idx = int(getattr(block, "target_slot_idx", -1))
+            if slot_idx < 0:
+                slot_idx = int(block.target_block_id)  # legacy fallback
+            local_indices.append(slot_idx)
             src_offset = int(block.source_descriptor.byte_offset)
             remote_indices.append(src_offset // block_size)
 
