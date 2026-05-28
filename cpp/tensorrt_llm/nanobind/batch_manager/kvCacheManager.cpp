@@ -547,6 +547,22 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_unique_secondary_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                // Parity with get_unique_primary_pool: returns the UNSLICED
+                // secondary pool tensor with shape (num_blocks, num_layers,
+                // kv_factor, blockSize) for block-major layouts. Same
+                // single-window / pool_idx=0 assumption baked in as
+                // get_unique_primary_pool. Unlike get_secondary_pool_data
+                // (which slices to a single layer's view), this exposes
+                // the full per-pool allocation so connectors can read the
+                // true per-logical-block stride and register the entire
+                // pool with NIXL.
+                return tr::Torch::tensor(self.getBlockManager().getSecondaryPool(0));
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
@@ -613,6 +629,20 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("pin_blocks_by_id", &BaseKVCacheManager::pinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("find_and_pin_secondary_block_by_hash", &BaseKVCacheManager::findAndPinSecondaryBlockByHash,
             nb::arg("block_hash"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_slot_idx_by_block_id",
+            [](BaseKVCacheManager& self, tbk::KVCacheBlock::IdType block_id, SizeType32 window_size)
+            {
+                // Non-pinning lookup: translates engine-allocated block_id
+                // (globally-unique, monotonic) into the dense per-pool
+                // slot index that NIXL dlists / byte_offset math need.
+                // Replaces the pin_blocks_by_id + immediate unpin_blocks_by_id
+                // borrow pattern with a clean read.
+                auto block = self.getBlockManager().getBlockById(block_id, window_size);
+                return block->getMemoryPoolBlockIndex();
+            },
+            nb::arg("block_id"), nb::arg("window_size"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
             nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());

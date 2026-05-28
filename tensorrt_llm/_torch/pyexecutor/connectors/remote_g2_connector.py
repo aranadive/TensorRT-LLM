@@ -48,6 +48,20 @@ _installed_release_lease: Optional[Callable[[str, str], bool]] = None
 _installed_transfer_adapter: Optional[Any] = None
 _installed_mark_local_valid: Optional[Callable[[RemoteG2BindingRecord], None]] = None
 _installed_publish_binding: Optional[Callable[[RemoteG2BindingRecord], None]] = None
+# Maps engine block_ids → primary-pool slot indices. Installed by the
+# target setup once the KV cache manager is available. The binding store
+# calls this when binding so NIXL's local dlist gets the right
+# dense per-slot index instead of the engine's globally-unique block_id.
+_installed_block_id_to_slot_idx: Optional[
+    Callable[[list[int]], list[int]]
+] = None
+
+
+def install_block_id_to_slot_idx(
+    fn: Callable[[list[int]], list[int]]
+) -> None:
+    global _installed_block_id_to_slot_idx
+    _installed_block_id_to_slot_idx = fn
 
 
 def install_resolve_and_lease(

@@ -364,6 +364,12 @@ class RemoteG2BoundBlock:
     target_block_id: int
     source_block_index: int
     target_block_index: int
+    # Primary-pool slot index for this block, used as the NIXL local
+    # dlist index. Engine-allocated block_id is globally unique and
+    # may exceed the primary pool's slot count (which dimensions the
+    # dlist); the slot_idx is the right dense index. -1 means
+    # unresolved (legacy bindings created without the lookup).
+    target_slot_idx: int = -1
 
 
 @dataclass
@@ -599,12 +605,44 @@ class TargetRemoteG2BindingStore:
                 return record
 
             target_block_ids = block_ids[computed_blocks:target_end]
+
+            # Resolve engine block_id → primary-pool slot_idx for each
+            # bound block. NIXL's local dlist is dense over primary
+            # pool slots, so we have to index by slot, not block_id.
+            # The lookup callable is installed by the target setup
+            # (remote_g2_connector._installed_block_id_to_slot_idx),
+            # since the engine block_id namespace is wider than the
+            # primary pool's slot space and we cannot use block_ids
+            # directly as NIXL local-dlist indices.
+            target_slot_indices: list[int] = []
+            target_block_ids_list = [int(b) for b in target_block_ids]
+            if target_block_ids_list:
+                from .remote_g2_connector import _installed_block_id_to_slot_idx
+                if _installed_block_id_to_slot_idx is not None:
+                    try:
+                        target_slot_indices = list(
+                            _installed_block_id_to_slot_idx(target_block_ids_list)
+                        )
+                    except Exception:
+                        target_slot_indices = []
+            if len(target_slot_indices) != len(target_block_ids_list):
+                # Couldn't resolve all slots; abort the binding so the
+                # request falls back to local recompute rather than
+                # issuing NIXL with stale/garbage indices.
+                self._release_record_once(
+                    record,
+                    "target_slot_lookup_failed",
+                    RemoteG2BindingState.BIND_FAILED,
+                )
+                return record
+
             record.bound_blocks = tuple(
                 RemoteG2BoundBlock(
                     source_descriptor=descriptor,
                     target_block_id=int(target_block_id),
                     source_block_index=plan_start + skip + offset,
                     target_block_index=computed_blocks + offset,
+                    target_slot_idx=target_slot_indices[offset],
                 )
                 for offset, (descriptor, target_block_id) in enumerate(
                     zip(source_descriptors, target_block_ids)

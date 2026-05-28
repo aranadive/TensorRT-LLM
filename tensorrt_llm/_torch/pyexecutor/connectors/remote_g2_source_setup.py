@@ -265,53 +265,62 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
 
 def _secondary_pool_base_ptr(kv: Any) -> int:
     """Return the secondary KV cache pool's base host address, or 0 when
-    not available (no host pool allocated, exposure binding missing, etc.)."""
+    not available (no host pool allocated, exposure binding missing, etc.).
+
+    Uses get_unique_secondary_pool() — the unsliced full pool tensor —
+    so the base pointer is unambiguous regardless of layout. The earlier
+    get_secondary_pool_data(0) path returned a per-layer slice whose
+    data_ptr() happened to coincide with the allocation base under
+    block-major layout, but would silently point at the wrong address
+    for a layer-first layout.
+    """
     try:
-        pool = kv.get_secondary_pool_data(0)
-        logging.warning(
-            "remote_g2 DEBUG: secondary pool type=%s is_none=%s "
-            "numel=%s data_ptr=%s",
-            type(pool).__name__,
-            pool is None,
-            getattr(pool, "numel", lambda: "?")() if pool is not None else "?",
-            getattr(pool, "data_ptr", lambda: "?")() if pool is not None else "?",
-        )
-        if pool is None:
+        pool = kv.get_unique_secondary_pool()
+        if pool is None or pool.numel() == 0:
             return 0
         return int(pool.data_ptr())
     except Exception as exc:
-        logging.warning("remote_g2 DEBUG: get_secondary_pool_data raised: %r", exc)
+        logging.warning("remote_g2: get_unique_secondary_pool raised: %r", exc)
         return 0
 
 
 def _derive_block_size_bytes(kv: Any) -> Optional[int]:
-    """Compute per-block byte size from the secondary pool's total bytes
-    divided by the C++-reported secondary capacity. Uses
-    KvCacheIterationStats.secondary_max_num_blocks (constant for the
-    worker's lifetime) so we never have to assume the pool tensor's
-    dimension order.
+    """Compute per-LOGICAL-block byte size from the unsliced secondary
+    pool tensor (parity with how the source-side NIXL agent registers
+    its memory).
+
+    Uses ``get_unique_secondary_pool()`` — the unsliced full secondary
+    pool with shape ``(num_blocks, num_layers, kv_factor, blockSize)``
+    for block-major layouts. One logical block occupies
+    ``num_layers × kv_factor × blockSize × element_size`` bytes, which
+    is the same as ``element_size × prod(shape[1:])``.
+
+    Layout assumption: standard transformers run block-major. For
+    recurrent-state / linear-attention models the first dim is
+    num_layers instead of num_blocks and this derivation would be
+    wrong; the modulo sanity check at the end catches that case as a
+    fail-loud rather than a silent corruption.
     """
     try:
-        pool = kv.get_secondary_pool_data(0)
+        pool = kv.get_unique_secondary_pool()
     except Exception:
         return None
-    if pool is None or pool.numel() == 0:
+    if pool is None or pool.numel() == 0 or pool.ndim < 2:
         return None
 
-    try:
-        iter_stats = kv.get_iteration_stats()
-    except Exception:
-        return None
-    if not iter_stats:
-        return None
-
-    stats = next(iter(iter_stats.values()))
-    num_secondary = int(getattr(stats, "secondary_max_num_blocks", 0) or 0)
-    if num_secondary <= 0:
+    per_block_elems = 1
+    for d in pool.shape[1:]:
+        per_block_elems *= int(d)
+    if per_block_elems <= 0:
         return None
 
-    total_bytes = pool.element_size() * pool.numel()
-    return total_bytes // num_secondary
+    per_block_bytes = int(pool.element_size()) * per_block_elems
+
+    total_bytes = int(pool.element_size()) * int(pool.numel())
+    if total_bytes % per_block_bytes != 0:
+        return None
+
+    return per_block_bytes
 
 
 def _derive_window_size(kv: Any) -> Optional[int]:
@@ -332,12 +341,17 @@ def _derive_window_size(kv: Any) -> Optional[int]:
 
 
 def _pool_size_bytes(kv: Any) -> Optional[int]:
-    """Total byte size of the host_pinned secondary pool — element_size *
-    numel of the tensor returned by C++ `get_secondary_pool_data(0)`. We
-    register this whole range with the NIXL agent so remote workers can
-    issue READs against any slot in it."""
+    """Total byte size of the host_pinned secondary pool covering all
+    layers. We register this whole range with the NIXL agent so remote
+    workers can issue READs against any slot in it.
+
+    Uses ``get_unique_secondary_pool()`` — the unsliced full secondary
+    pool tensor — so the total size is the direct
+    ``element_size × numel`` of the underlying allocation, without
+    needing to multiply by num_layers manually.
+    """
     try:
-        pool = kv.get_secondary_pool_data(0)
+        pool = kv.get_unique_secondary_pool()
     except Exception:
         return None
     if pool is None or pool.numel() == 0:

@@ -41,6 +41,7 @@ from .remote_g2 import (
 )
 from .remote_g2_source_setup import (
     _derive_block_size_bytes,
+    _derive_window_size,
     _resolve_source_identity,
     _walk_to_dynamo_worker_pid,
 )
@@ -285,7 +286,15 @@ def _make_target_descriptor_resolver(
     def _resolve(record: RemoteG2BindingRecord) -> Sequence[RemoteG2TransferDescriptor]:
         descs = []
         for block in record.bound_blocks:
-            ptr = int(primary_pool_base_ptr) + int(block.target_block_id) * int(block_size_bytes)
+            # Use the primary-pool slot index (resolved at bind time) rather
+            # than the engine's block_id; block_ids are globally unique
+            # across all blocks ever allocated and may exceed the primary
+            # pool's slot count, while slot_idx is the dense per-pool index
+            # that ptr arithmetic needs.
+            slot_idx = int(getattr(block, "target_slot_idx", -1))
+            if slot_idx < 0:
+                slot_idx = int(block.target_block_id)  # legacy fallback
+            ptr = int(primary_pool_base_ptr) + slot_idx * int(block_size_bytes)
             descs.append(
                 RemoteG2TransferDescriptor(
                     ptr=ptr,
@@ -760,6 +769,26 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
 
     remote_g2_connector.install_resolve_and_lease(resolve_fn)
     remote_g2_connector.install_release_lease(release_fn)
+
+    # Install the block_id → primary-pool slot_idx lookup the binding
+    # store uses to build NIXL local-dlist indices. Uses the non-pinning
+    # C++ accessor get_slot_idx_by_block_id, which composes
+    # getBlockById(id, window) -> getMemoryPoolBlockIndex() under one
+    # call — no refcount bump, no race window.
+    window_size = _derive_window_size(kv)
+
+    def _block_id_to_slot_idx(block_ids: list[int]) -> list[int]:
+        if not block_ids or window_size is None:
+            return []
+        try:
+            return [
+                int(kv.get_slot_idx_by_block_id(int(b), int(window_size)))
+                for b in block_ids
+            ]
+        except Exception:
+            return []
+
+    remote_g2_connector.install_block_id_to_slot_idx(_block_id_to_slot_idx)
 
     logging.warning(
         "remote_g2: target client installed "
