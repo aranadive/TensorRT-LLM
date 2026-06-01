@@ -112,6 +112,19 @@ TargetRemoteG2BindingStore = REMOTE_G2.TargetRemoteG2BindingStore
 InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
 
 
+@pytest.fixture(autouse=True)
+def _install_identity_slot_lookup():
+    """Production wires this up via maybe_start_remote_g2_target_client; the
+    unit tests construct TargetRemoteG2BindingStore directly and bypass that
+    setup, so without a stub bind_target_blocks fails with
+    target_slot_lookup_failed. Install an identity stub (slot_idx == block_id)
+    for the test, restore previous value after."""
+    saved = REMOTE_G2_CONNECTOR._installed_block_id_to_slot_idx
+    REMOTE_G2_CONNECTOR.install_block_id_to_slot_idx(lambda ids: list(ids))
+    yield
+    REMOTE_G2_CONNECTOR._installed_block_id_to_slot_idx = saved
+
+
 def _plan(**overrides):
     plan = {
         "plan_id": "plan-1",
