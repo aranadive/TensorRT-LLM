@@ -37,6 +37,29 @@ def _missing_release_lease(lease_id: str, reason: str) -> bool:
     return False
 
 
+def _assert_partial_reuse_disabled(llm_args: Any) -> None:
+    """Hard-fail at construction if ``kv_cache_config.enable_partial_reuse``
+    is left on the default ``True`` while the remote-G2 connector is active.
+
+    Partial reuse silently stops remote-G2 fetch from triggering on
+    subsequent requests, so misconfiguration must surface as a startup error
+    rather than as a quiet drop in hit rate. The connector class being
+    constructed at all means the user has selected remote_g2 — no further
+    gate is needed.
+    """
+    kv_cache_config = getattr(llm_args, "kv_cache_config", None)
+    if kv_cache_config is None:
+        return
+    if getattr(kv_cache_config, "enable_partial_reuse", False):
+        raise RuntimeError(
+            "remote_g2: kv_cache_config.enable_partial_reuse must be set to "
+            "False when the remote-G2 connector is enabled (currently True, "
+            "the default). Leaving it on prevents remote-G2 fetch from "
+            "triggering on subsequent requests; the failure mode is silent "
+            "(no error, just no remote-G2 hits)."
+        )
+
+
 # Module-state slots for callables installed from outside (typically by
 # remote_g2_target_setup.maybe_start_remote_g2_target_client). The
 # connector scheduler/worker read these lazily at call time so that
@@ -122,6 +145,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         super().__init__(llm_args)
+        _assert_partial_reuse_disabled(llm_args)
         self._observability = observability or NullRemoteG2ObservabilitySink()
         self._plan_store = (
             plan_store if plan_store is not None else target_remote_g2_plan_store()
@@ -243,6 +267,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         super().__init__(llm_args)
+        _assert_partial_reuse_disabled(llm_args)
         # Worker is constructed by PyExecutor with just llm_args, before
         # maybe_start_remote_g2_target_client runs - none of the
         # adapter / hooks can be wired at that point. Stash whatever was
