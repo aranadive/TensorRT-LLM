@@ -534,3 +534,39 @@ def test_remote_g2_worker_observability_never_logs_raw_descriptors():
     for event in sink.events:
         detail_text = " ".join(event.details)
         assert not any(value in detail_text for value in forbidden)
+
+
+# Startup check: kv_cache_config.enable_partial_reuse must be False when the
+# remote-G2 connector is constructed. Partial reuse silently stops remote-G2
+# fetch from triggering, so misconfiguration must fail fast.
+
+def _llm_args_with_partial_reuse(enabled: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_cache_config=SimpleNamespace(enable_partial_reuse=enabled)
+    )
+
+
+def test_scheduler_init_fails_when_partial_reuse_enabled():
+    with pytest.raises(RuntimeError, match="enable_partial_reuse"):
+        REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler(
+            _llm_args_with_partial_reuse(True)
+        )
+
+
+def test_worker_init_fails_when_partial_reuse_enabled():
+    with pytest.raises(RuntimeError, match="enable_partial_reuse"):
+        REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+            _llm_args_with_partial_reuse(True)
+        )
+
+
+def test_scheduler_init_succeeds_when_partial_reuse_disabled():
+    REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler(
+        _llm_args_with_partial_reuse(False)
+    )
+
+
+def test_worker_init_succeeds_when_partial_reuse_disabled():
+    REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        _llm_args_with_partial_reuse(False)
+    )
