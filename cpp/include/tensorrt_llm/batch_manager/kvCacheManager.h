@@ -63,6 +63,21 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+enum class CachePoolTier
+{
+    kPrimary,
+    kHostPinned,
+};
+
+struct CacheLookupResult
+{
+    size_t blockHash;
+    bool pinned{false};
+    std::optional<CachePoolTier> foundTier{std::nullopt};
+    std::int32_t blockId{-1};
+    SizeType32 slotIdx{-1};
+};
+
 // Extra block buffer allocated for SWA to be able to always keep "window size"
 // tokens held in the blocks.
 static constexpr SizeType32 kSWAExtraBlock = 1;
@@ -1222,27 +1237,21 @@ public:
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
-    //! \brief Atomic find-and-pin of a tree-attached SECONDARY (host-pool) block by its
-    //! content hash. Primary blocks are intentionally skipped: pinning a primary VRAM
-    //! block would steal it from the inference engine, and the remote-G2 transfer
-    //! path is host-pool-only by design.
+    //! \brief Tier-aware batch lookup by block hash. Blocks found in requestedTier
+    //! are atomically pinned and returned with block_id + slot_idx. Blocks found in
+    //! another tier are reported as misses with foundTier set and are not pinned.
     //!
-    //! Returns std::nullopt if no live secondary block in this window currently caches
-    //! the requested hash. On success, returns (block_id, post-pin slot_idx) and the
-    //! block's refcount has been bumped (caller MUST call unpinBlocksById once done).
-    //!
-    //! \details Three races this method intentionally closes:
+    //! With stopOnMiss=true, lookup stops at the first unpinned result. Returned
+    //! pinned blocks must be released by the caller via unpinBlocksById.
+    //! \details This method intentionally closes:
     //!   1. find-then-pin: lookup walk and refcount bump happen under the same
     //!      lookupTree mutex, so the block found cannot be evicted before being pinned.
-    //!   2. swap-before-DMA-commit: after a primary→secondary offload, the lookup
-    //!      tree's hash→slot pointer is updated immediately but the underlying DMA
+    //!   2. swap-before-DMA-commit: after a primary->secondary offload, the lookup
+    //!      tree's hash-to-slot pointer is updated immediately but the underlying DMA
     //!      copy is queued on the offload stream and may not be visible to a NIXL
-    //!      reader. This method waits on mPendingWrites[slot] before returning, so
-    //!      the caller sees committed bytes.
-    //!   3. tier flip: by restricting to secondary blocks, we avoid the case where a
-    //!      block found in primary gets demoted to secondary mid-transfer.
-    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
-    findAndPinSecondaryBlockByHash(size_t blockHash);
+    //!      reader. Host-pinned hits wait on mPendingWrites[slot] before returning.
+    [[nodiscard]] std::vector<CacheLookupResult> findAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -1845,15 +1854,25 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
     }
 
-    [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
-    findAndPinSecondaryBlockByHash(size_t blockHash, SizeType32 windowSize)
+    [[nodiscard]] std::vector<CacheLookupResult> findAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
     {
         auto it = mWindowBlockManagers.find(windowSize);
         if (it == mWindowBlockManagers.end())
         {
-            return std::nullopt;
+            std::vector<CacheLookupResult> results;
+            results.reserve(blockHashes.size());
+            for (auto const blockHash : blockHashes)
+            {
+                results.push_back(CacheLookupResult{blockHash});
+                if (stopOnMiss)
+                {
+                    break;
+                }
+            }
+            return results;
         }
-        return it->second.findAndPinSecondaryBlockByHash(blockHash);
+        return it->second.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -2229,8 +2248,8 @@ public:
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
-    [[nodiscard]] virtual std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
-    findAndPinSecondaryBlockByHash(size_t blockHash, SizeType32 windowSize)
+    [[nodiscard]] virtual std::vector<CacheLookupResult> findAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2665,10 +2684,11 @@ public:
         return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
-    std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> findAndPinSecondaryBlockByHash(
-        size_t blockHash, SizeType32 windowSize) override
+    std::vector<CacheLookupResult> findAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
+        override
     {
-        return mBlockManager.findAndPinSecondaryBlockByHash(blockHash, windowSize);
+        return mBlockManager.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss, windowSize);
     }
 
     void resetReuseState() override

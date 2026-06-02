@@ -5062,11 +5062,11 @@ TEST_F(KVCacheManagerTest, GetPrimaryAndSecondaryPool)
     }
 }
 
-// Verifies that findAndPinSecondaryBlockByHash returns std::nullopt for primary-only
-// blocks (intentional — the API is secondary-only), succeeds for blocks that have
-// been offloaded to secondary, atomically pins the matched block, and returns
-// std::nullopt for unknown hashes / wrong windows.
-TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSecondary)
+// Verifies that findAndPinBlocksByHash reports primary-only blocks as found in
+// primary without pinning, succeeds for blocks that have been offloaded to
+// secondary, atomically pins the matched block, and reports unknown hashes /
+// wrong windows as misses.
+TEST_F(KVCacheManagerTest, FindAndPinBlocksByHashReportsTierAndPinsHostPinned)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
     auto constexpr numLayers = 2;
@@ -5101,14 +5101,20 @@ TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSeco
     ASSERT_GE(blockIds.size(), 1);
     auto& blockManager = kvCacheManager.getBlockManager();
 
-    // Blocks are currently primary-only — find_and_pin must skip them all.
+    // Blocks are currently primary-only: host-pinned lookup must not pin them,
+    // but it should report their observed primary tier.
     for (auto bid : blockIds)
     {
         auto block = blockManager.getBlockById(bid, maxAttentionWindow);
         ASSERT_NE(block, nullptr);
-        auto result = kvCacheManager.findAndPinSecondaryBlockByHash(block->getHash(), maxAttentionWindow);
-        EXPECT_FALSE(result.has_value())
-            << "primary-only block " << bid << " must NOT be returned by secondary-only lookup";
+        auto results = kvCacheManager.findAndPinBlocksByHash(
+            {block->getHash()}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        ASSERT_EQ(results.size(), 1);
+        EXPECT_EQ(results[0].blockHash, block->getHash());
+        EXPECT_FALSE(results[0].pinned);
+        ASSERT_TRUE(results[0].foundTier.has_value());
+        EXPECT_EQ(*results[0].foundTier, CachePoolTier::kPrimary);
+        EXPECT_FALSE(block->hasRefs()) << "primary-only block " << bid << " must not be pinned";
     }
 
     // Force the stored blocks to migrate to secondary by allocating more primary
@@ -5137,11 +5143,16 @@ TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSeco
             continue;
         }
         size_t blockHash = block->getHash();
-        auto result = kvCacheManager.findAndPinSecondaryBlockByHash(blockHash, maxAttentionWindow);
-        ASSERT_TRUE(result.has_value()) << "secondary block " << bid << " should be findable";
-        auto [foundBlockId, slotIdx] = *result;
+        auto results
+            = kvCacheManager.findAndPinBlocksByHash({blockHash}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_TRUE(results[0].pinned) << "secondary block " << bid << " should be findable";
+        auto foundBlockId = results[0].blockId;
+        auto slotIdx = results[0].slotIdx;
         EXPECT_EQ(foundBlockId, bid);
         EXPECT_GE(slotIdx, 0);
+        ASSERT_TRUE(results[0].foundTier.has_value());
+        EXPECT_EQ(*results[0].foundTier, CachePoolTier::kHostPinned);
         EXPECT_TRUE(block->hasRefs()) << "block " << bid << " must be pinned by find_and_pin";
         pinnedIds.push_back(foundBlockId);
     }
@@ -5152,13 +5163,19 @@ TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSeco
     // Unpin to leave a clean state for subsequent tests.
     kvCacheManager.unpinBlocksById(pinnedIds);
 
-    // Unknown hash returns nullopt.
-    auto missing = kvCacheManager.findAndPinSecondaryBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow);
-    EXPECT_FALSE(missing.has_value());
+    // Unknown hash returns a miss with no found tier.
+    auto missing = kvCacheManager.findAndPinBlocksByHash(
+        {0xdeadbeefdeadbeefULL}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+    ASSERT_EQ(missing.size(), 1);
+    EXPECT_FALSE(missing[0].pinned);
+    EXPECT_FALSE(missing[0].foundTier.has_value());
 
-    // Unknown window returns nullopt (empty optional, not a crash).
-    auto wrongWindow = kvCacheManager.findAndPinSecondaryBlockByHash(0, maxAttentionWindow + 1);
-    EXPECT_FALSE(wrongWindow.has_value());
+    // Unknown window returns a miss, not a crash.
+    auto wrongWindow
+        = kvCacheManager.findAndPinBlocksByHash({0}, CachePoolTier::kHostPinned, true, maxAttentionWindow + 1);
+    ASSERT_EQ(wrongWindow.size(), 1);
+    EXPECT_FALSE(wrongWindow[0].pinned);
+    EXPECT_FALSE(wrongWindow[0].foundTier.has_value());
 }
 
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block

@@ -2107,60 +2107,86 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     return searchReuseTree(blockKeys);
 }
 
-std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> WindowBlockManager::findAndPinSecondaryBlockByHash(
-    size_t blockHash)
+std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
+    std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss)
 {
+    std::vector<CacheLookupResult> results;
+    results.reserve(blockHashes.size());
+
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
-    for (auto const& block : mAllBlocksById)
+    for (auto const blockHash : blockHashes)
     {
-        if (block == nullptr || block->isPlaceholder())
+        BlockPtr requestedTierBlock;
+        std::optional<CachePoolTier> foundOtherTier;
+
+        for (auto const& block : mAllBlocksById)
         {
-            continue;
+            if (block == nullptr || block->isPlaceholder())
+            {
+                continue;
+            }
+            if (block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+            {
+                continue;
+            }
+            // A block "caches" a hash only while attached to the lookup tree.
+            if (block->getLookupNode() == nullptr)
+            {
+                continue;
+            }
+            if (block->getHash() != blockHash)
+            {
+                continue;
+            }
+
+            auto const blockTier = block->isPrimary() ? CachePoolTier::kPrimary : CachePoolTier::kHostPinned;
+            if (blockTier == requestedTier)
+            {
+                requestedTierBlock = block;
+                break;
+            }
+            foundOtherTier = blockTier;
         }
-        if (block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+
+        if (requestedTierBlock == nullptr)
         {
-            continue;
-        }
-        // A block "caches" a hash only while attached to the lookup tree.
-        if (block->getLookupNode() == nullptr)
-        {
-            continue;
-        }
-        if (block->getHash() != blockHash)
-        {
-            continue;
-        }
-        // remote-G2 transfer is host-pool-only. A primary VRAM match is intentionally
-        // skipped — pinning it would steal blocks from the inference engine and the
-        // adapter would reject it anyway.
-        if (block->isPrimary())
-        {
+            results.push_back(CacheLookupResult{
+                blockHash, false, foundOtherTier, std::int32_t{-1}, SizeType32{-1}});
+            if (stopOnMiss)
+            {
+                break;
+            }
             continue;
         }
 
         // Atomic pin (claim from free queue + refcount bump) under the lookup mutex,
         // mirroring pinBlocksById's body but inlined here so the bump cannot race
         // against an eviction that observes the block momentarily unpinned.
-        if (!block->hasRefs())
+        if (!requestedTierBlock->hasRefs())
         {
-            mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+            mEvictionPolicy->claimBlock(
+                requestedTierBlock, requestedTierBlock->getPriority(), requestedTierBlock->getDurationMs());
         }
-        block->incRefCount();
+        requestedTierBlock->incRefCount();
 
         // Capture the post-pin slot AFTER refcount bump and BEFORE releasing the
         // lookup mutex so the returned slot cannot diverge from the held pin.
-        auto const slotIdx = block->getMemoryPoolBlockIndex();
+        auto const slotIdx = requestedTierBlock->getMemoryPoolBlockIndex();
 
-        // CPU-side wait for any in-flight offload DMA targeting this slot. The
-        // lookup-tree → secondary-slot pointer is committed at offload() time, but
-        // the actual primary→secondary copy is queued on the offload stream and
-        // not yet visible to a NIXL/RDMA reader. Without this sync, the network
-        // adapter would pull the slot's pre-offload contents.
-        mTransferManager->waitForPendingWrite(slotIdx);
+        if (requestedTier == CachePoolTier::kHostPinned)
+        {
+            // CPU-side wait for any in-flight offload DMA targeting this slot. The
+            // lookup-tree to secondary-slot pointer is committed at offload() time,
+            // but the actual primary to secondary copy is queued on the offload
+            // stream and not yet visible to a NIXL/RDMA reader.
+            mTransferManager->waitForPendingWrite(slotIdx);
+        }
 
-        return std::make_tuple(block->getBlockId(), slotIdx);
+        results.push_back(CacheLookupResult{
+            blockHash, true, requestedTier, std::int32_t{requestedTierBlock->getBlockId()}, slotIdx});
     }
-    return std::nullopt;
+
+    return results;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::searchReuseTree(std::vector<BlockKey> const& blockKeys)
