@@ -5097,25 +5097,50 @@ TEST_F(KVCacheManagerTest, FindAndPinBlocksByHashReportsTierAndPinsHostPinned)
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     kvCacheManager.storeContextBlocks(*llmRequest);
 
-    auto const& blockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
+    auto const blockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
     ASSERT_GE(blockIds.size(), 1);
     auto& blockManager = kvCacheManager.getBlockManager();
 
-    // Blocks are currently primary-only: host-pinned lookup must not pin them,
-    // but it should report their observed primary tier.
+    // Blocks that storeContextBlocks registered in the reuse trie are currently
+    // primary-only: a host-pinned lookup must NOT pin them (wrong tier), but it must
+    // still report their observed primary tier so a caller can detect the block lives
+    // in primary rather than host-pinned. Blocks not attached to the trie (e.g. the
+    // trailing block holding the last, not-yet-stored token) are not discoverable by
+    // hash and are skipped here.
+    size_t primaryBlocksChecked = 0;
     for (auto bid : blockIds)
     {
         auto block = blockManager.getBlockById(bid, maxAttentionWindow);
         ASSERT_NE(block, nullptr);
+        if (block->getLookupNode() == nullptr)
+        {
+            // Not registered for reuse -> not findable by hash; nothing to assert.
+            continue;
+        }
+        ASSERT_TRUE(block->isPrimary());
         auto results = kvCacheManager.findAndPinBlocksByHash(
             {block->getHash()}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
         ASSERT_EQ(results.size(), 1);
         EXPECT_EQ(results[0].blockHash, block->getHash());
+        // Wrong-tier match: reported with foundTier set but not pinned. results[0].pinned
+        // is the authoritative "did the lookup take a reference" signal; block->hasRefs()
+        // cannot be used here because the owning live sequence already holds a ref.
         EXPECT_FALSE(results[0].pinned);
+        EXPECT_EQ(results[0].blockId, -1);
+        EXPECT_EQ(results[0].slotIdx, -1);
         ASSERT_TRUE(results[0].foundTier.has_value());
         EXPECT_EQ(*results[0].foundTier, CachePoolTier::kPrimary);
-        EXPECT_FALSE(block->hasRefs()) << "primary-only block " << bid << " must not be pinned";
+        ++primaryBlocksChecked;
     }
+    ASSERT_GT(primaryBlocksChecked, 0u)
+        << "no stored primary block was registered in the reuse trie; "
+           "storeContextBlocks precondition is ineffective";
+
+    // Release the owning sequence so its stored blocks become zero-ref reuse
+    // candidates. While the sequence is live its blocks are pinned and cannot be
+    // offloaded, so the pressure workload below would otherwise exhaust the primary
+    // pool ("No free block found") instead of migrating the stored block to secondary.
+    (void) kvCacheManager.removeSequence(requestId, llmRequest);
 
     // Force the stored blocks to migrate to secondary by allocating more primary
     // blocks than the primary pool can hold; the eviction policy will offload.

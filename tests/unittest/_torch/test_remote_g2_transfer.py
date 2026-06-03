@@ -69,6 +69,33 @@ def _load_transfer_modules():
 
 REMOTE_G2, TRANSFER = _load_transfer_modules()
 
+
+# bind_target_blocks does a lazy `from .remote_g2_connector import
+# _installed_block_id_to_slot_idx`. Production installs the callable via
+# maybe_start_remote_g2_target_client; these tests bypass that setup, so we
+# preload a stub remote_g2_connector module in sys.modules with an identity
+# callable so the lazy import resolves and binding can proceed.
+_g2_connector_stub = types.ModuleType(
+    f"{_CONNECTOR_PACKAGE}.remote_g2_connector"
+)
+_g2_connector_stub._installed_block_id_to_slot_idx = lambda ids: list(ids)
+sys.modules[f"{_CONNECTOR_PACKAGE}.remote_g2_connector"] = _g2_connector_stub
+
+
+@pytest.fixture(autouse=True)
+def _identity_slot_lookup_for_lazy_import():
+    """The lazy import in bind_target_blocks resolves to whatever module
+    happens to be at sys.modules[...remote_g2_connector] when the test runs.
+    Other test files (e.g. test_remote_g2_connector.py) load the real module
+    and may leave `_installed_block_id_to_slot_idx` at None on teardown, so
+    we re-stamp it before each test here and restore on exit."""
+    module = sys.modules[f"{_CONNECTOR_PACKAGE}.remote_g2_connector"]
+    saved = getattr(module, "_installed_block_id_to_slot_idx", None)
+    module._installed_block_id_to_slot_idx = lambda ids: list(ids)
+    yield
+    module._installed_block_id_to_slot_idx = saved
+
+
 RemoteG2Descriptor = REMOTE_G2.RemoteG2Descriptor
 RemoteG2ResolveResult = REMOTE_G2.RemoteG2ResolveResult
 RemoteKvReusePlan = REMOTE_G2.RemoteKvReusePlan
