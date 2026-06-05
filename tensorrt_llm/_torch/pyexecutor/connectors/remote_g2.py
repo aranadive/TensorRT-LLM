@@ -30,6 +30,8 @@ REMOTE_KV_REUSE_PLAN_VERSION = 1
 REMOTE_G2_REUSE_ENABLED_ENV = "DYN_REMOTE_G2_REUSE_ENABLED"
 
 _REMOTE_G2_TIERS = {"g2", "host_pinned", "hostpinned", "cpu_pinned", "cpu_tier1"}
+_CACHE_TIER_PRIMARY = "primary"
+_CACHE_TIER_HOST_PINNED = "host_pinned"
 
 
 def _now_ms() -> int:
@@ -294,7 +296,7 @@ class SourceG2DescriptorRecord:
     live: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
     lease_count: int = 0
-    # True when find_and_pin_secondary_block_by_hash already bumped refcount on
+    # True when find_and_pin_blocks_by_hash already bumped refcount on
     # this block; the resolve-time acquire_pin should not pin again.
     _pinned_by_lookup: bool = False
 
@@ -322,6 +324,23 @@ class RemoteG2BlockStatus:
     block_hash: int
     status: str
     descriptor_generation: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PinnedCacheBlock:
+    block_hash: int
+    block_id: int
+    slot_idx: int
+    tier: str = _CACHE_TIER_HOST_PINNED
+
+
+@dataclass(frozen=True)
+class CacheMiss:
+    block_hash: int
+    found_tier: Optional[str] = None
+
+
+CacheLookupResult = PinnedCacheBlock | CacheMiss
 
 
 @dataclass
@@ -942,11 +961,40 @@ class SourceG2DescriptorRegistry:
         with self._lock:
             records: list[SourceG2DescriptorRecord] = []
             per_block_status: list[RemoteG2BlockStatus] = []
-            for i, identity_hash in enumerate(identity_hashes):
+            i = 0
+            while i < len(identity_hashes):
+                identity_hash = identity_hashes[i]
                 kv_hash = int(kv_hashes[i])
                 record = self._records.get(kv_hash)
                 if record is None and self._kv is not None:
-                    record = self._lookup_via_find_block_by_hash(kv_hash)
+                    lookup_results = self._find_and_pin_blocks_by_hash(kv_hashes[i:])
+                    if not lookup_results:
+                        per_block_status.append(
+                            RemoteG2BlockStatus(int(identity_hash), "missing")
+                        )
+                        break
+                    for offset, lookup_result in enumerate(lookup_results):
+                        current_identity_hash = int(identity_hashes[i + offset])
+                        if isinstance(lookup_result, CacheMiss):
+                            status = (
+                                "promoted_primary"
+                                if lookup_result.found_tier == _CACHE_TIER_PRIMARY
+                                else "missing"
+                            )
+                            per_block_status.append(
+                                RemoteG2BlockStatus(current_identity_hash, status)
+                            )
+                            break
+                        record = self._record_from_pinned_cache_block(lookup_result)
+                        records.append(record)
+                        per_block_status.append(
+                            RemoteG2BlockStatus(
+                                current_identity_hash,
+                                "live",
+                                record.descriptor_generation,
+                            )
+                        )
+                    break
                 if record is None:
                     per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "missing"))
                     break
@@ -972,6 +1020,7 @@ class SourceG2DescriptorRegistry:
                         int(identity_hash), "live", record.descriptor_generation
                     )
                 )
+                i += 1
 
             if not records:
                 return RemoteG2ResolveResult(
@@ -1069,42 +1118,62 @@ class SourceG2DescriptorRegistry:
         if self._release_pin is not None:
             self._release_pin(pin_ref)
 
-    def _lookup_via_find_block_by_hash(
-        self, block_hash: int
-    ) -> Optional[SourceG2DescriptorRecord]:
-        """Resolve a block by hash through the C++ KV cache manager via the
-        atomic find_and_pin_secondary_block_by_hash API. The returned record
-        is anchored to the POST-PIN slot, and the underlying C++ call has
-        already pinned the block + waited for any in-flight offload DMA to
-        commit. The downstream acquire_pin path must only register the pin
-        with the lease (NOT pin again), and the lease release must unpin it.
+    def _find_and_pin_blocks_by_hash(
+        self, block_hashes: tuple[int, ...]
+    ) -> list[CacheLookupResult]:
+        """Resolve blocks through the live C++ KV cache manager.
 
-        Returns None if no live secondary block in this window currently
-        caches the requested hash. Returning None correctly steers the caller
-        away from remote-G2 reuse (target falls back to local prefill).
+        Returned PinnedCacheBlock entries are already pinned in the requested
+        host-pinned tier. CacheMiss(found_tier="primary") means the block was
+        observed in primary and was not pinned.
         """
         if self._window_size is None or self._block_size_bytes <= 0:
-            return None
+            return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
         try:
-            loc = self._kv.find_and_pin_secondary_block_by_hash(
-                block_hash, int(self._window_size)
+            raw_results = self._kv.find_and_pin_blocks_by_hash(
+                [int(block_hash) for block_hash in block_hashes],
+                int(self._window_size),
+                tier=_CACHE_TIER_HOST_PINNED,
+                stop_on_miss=True,
             )
         except Exception:
-            return None
-        if loc is None:
-            return None
-        block_id, slot_idx = loc
-        byte_offset = int(slot_idx) * self._block_size_bytes
+            return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
+
+        results: list[CacheLookupResult] = []
+        for raw in raw_results:
+            if bool(raw.get("pinned", False)):
+                results.append(
+                    PinnedCacheBlock(
+                        block_hash=int(raw["block_hash"]),
+                        block_id=int(raw["block_id"]),
+                        slot_idx=int(raw["slot_idx"]),
+                        tier=str(raw.get("found_tier") or _CACHE_TIER_HOST_PINNED),
+                    )
+                )
+            else:
+                found_tier = raw.get("found_tier")
+                results.append(
+                    CacheMiss(
+                        block_hash=int(raw["block_hash"]),
+                        found_tier=str(found_tier) if found_tier is not None else None,
+                    )
+                )
+        return results
+
+    def _record_from_pinned_cache_block(
+        self, pinned: PinnedCacheBlock
+    ) -> SourceG2DescriptorRecord:
+        byte_offset = int(pinned.slot_idx) * self._block_size_bytes
         record = SourceG2DescriptorRecord(
-            block_hash=block_hash,
+            block_hash=pinned.block_hash,
             source_worker_id=self.source_worker_id,
             source_dp_rank=self.source_dp_rank,
-            tier=self._tier,
+            tier=pinned.tier,
             descriptor_generation=1,
             pool_id=self._pool_id,
             byte_offset=byte_offset,
             byte_length=self._block_size_bytes,
-            block_id=int(block_id),
+            block_id=int(pinned.block_id),
             live=True,
             metadata={
                 "nixl_memory_desc": {
@@ -1113,9 +1182,9 @@ class SourceG2DescriptorRegistry:
                 }
             },
         )
-        # The C++ atomic find+pin already bumped refcount on this block. The
+        # The C++ tier-aware lookup already bumped refcount on this block. The
         # downstream acquire_pin callback must NOT call pin_blocks_by_id again
-        # — it should only register this pin with the lease so release_lease
+        # - it should only register this pin with the lease so release_lease
         # can unpin once the transfer completes.
         record._pinned_by_lookup = True
         return record

@@ -40,6 +40,8 @@
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
 
+#include <stdexcept>
+
 namespace tb = tensorrt_llm::batch_manager;
 namespace tbc = tensorrt_llm::batch_manager::kv_connector;
 namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
@@ -57,6 +59,29 @@ NB_MAKE_OPAQUE(CacheBlockIds);
 
 namespace
 {
+char const* cachePoolTierToString(tbk::CachePoolTier tier)
+{
+    switch (tier)
+    {
+    case tbk::CachePoolTier::kPrimary: return "primary";
+    case tbk::CachePoolTier::kHostPinned: return "host_pinned";
+    }
+    throw std::invalid_argument("unknown CachePoolTier");
+}
+
+tbk::CachePoolTier cachePoolTierFromString(std::string const& tier)
+{
+    if (tier == "primary")
+    {
+        return tbk::CachePoolTier::kPrimary;
+    }
+    if (tier == "host_pinned")
+    {
+        return tbk::CachePoolTier::kHostPinned;
+    }
+    throw std::invalid_argument("unknown cache pool tier: " + tier);
+}
+
 std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optional<at::Tensor> torchPtr)
 {
     if (torchPtr)
@@ -271,6 +296,12 @@ public:
     void flushIterationEvents() override
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
+    }
+
+    std::vector<tbk::CacheLookupResult> findAndPinBlocksByHash(std::vector<size_t> const& blockHashes,
+        tbk::CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize) override
+    {
+        NB_OVERRIDE_PURE(findAndPinBlocksByHash, blockHashes, requestedTier, stopOnMiss, windowSize);
     }
 };
 
@@ -627,8 +658,44 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks_by_id", &BaseKVCacheManager::pinBlocksById, nb::call_guard<nb::gil_scoped_release>())
-        .def("find_and_pin_secondary_block_by_hash", &BaseKVCacheManager::findAndPinSecondaryBlockByHash,
-            nb::arg("block_hash"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "find_and_pin_blocks_by_hash",
+            [](BaseKVCacheManager& self, std::vector<size_t> const& block_hashes, SizeType32 window_size,
+                std::string const& tier, bool stop_on_miss)
+            {
+                auto const requestedTier = cachePoolTierFromString(tier);
+                auto results
+                    = self.findAndPinBlocksByHash(block_hashes, requestedTier, stop_on_miss, window_size);
+                nb::list pyResults;
+                for (auto const& result : results)
+                {
+                    nb::dict item;
+                    item["block_hash"] = result.blockHash;
+                    item["pinned"] = result.pinned;
+                    if (result.foundTier)
+                    {
+                        item["found_tier"] = cachePoolTierToString(*result.foundTier);
+                    }
+                    else
+                    {
+                        item["found_tier"] = nb::none();
+                    }
+                    if (result.pinned)
+                    {
+                        item["block_id"] = result.blockId;
+                        item["slot_idx"] = result.slotIdx;
+                    }
+                    else
+                    {
+                        item["block_id"] = nb::none();
+                        item["slot_idx"] = nb::none();
+                    }
+                    pyResults.append(item);
+                }
+                return pyResults;
+            },
+            nb::arg("block_hashes"), nb::arg("window_size"), nb::arg("tier") = "host_pinned",
+            nb::arg("stop_on_miss") = true)
         .def(
             "get_slot_idx_by_block_id",
             [](BaseKVCacheManager& self, tbk::KVCacheBlock::IdType block_id, SizeType32 window_size)

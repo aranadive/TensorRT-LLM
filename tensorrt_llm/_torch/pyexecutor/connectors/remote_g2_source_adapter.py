@@ -183,7 +183,7 @@ def make_kv_pin_callbacks(
         if block_id < 0:
             raise ValueError(f"record block_id is invalid: {block_id}")
 
-        # find_and_pin_secondary_block_by_hash already pinned the block atomically
+        # find_and_pin_blocks_by_hash already pinned the block atomically
         # under the lookup-tree mutex and waited for any in-flight offload DMA. We
         # only need to thread the block_id through to the lease so release_pin can
         # unpin it later. Pinning again would inflate the refcount and we'd have to
@@ -193,7 +193,7 @@ def make_kv_pin_callbacks(
 
         # Fallback path for records produced outside of
         # _lookup_via_find_block_by_hash (e.g. publisher-event-derived records that
-        # weren't pinned at lookup). Pin here, secondary-only.
+        # weren't pinned at lookup). Pin here for host-pinned records only.
         locations = kv_cache_manager.pin_blocks_by_id([block_id])
         if not locations:
             raise RuntimeError(
