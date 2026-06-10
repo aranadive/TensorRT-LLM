@@ -1179,6 +1179,13 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload
         && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
+        TLLM_LOG_DEBUG(
+            "%s::getFreeBlock - Offloading block %d (hash=%zu) from primary to secondary "
+            "(secFree=%zu, blockTokens=%zu, inRadixTree=%s)",
+            mLogPrefix.c_str(), block->getBlockId(), block->getHash(),
+            mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel),
+            block->getUniqueTokens().size(),
+            blockInRadixTree(block) ? "true" : "false");
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
 
@@ -1210,6 +1217,16 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         // The final claimBlock() below will be a no-op for the queue but still
         // applies the caller's priority/durationMs.
         block = offloadBlock;
+    }
+    else if (!wantPlaceholder && !block->getUniqueTokens().empty())
+    {
+        // Offload was skipped — log the reason for diagnosing TP asymmetry.
+        TLLM_LOG_DEBUG(
+            "%s::getFreeBlock - Offload SKIPPED for block %d (hash=%zu): "
+            "canOffload=%s, secFree=%zu",
+            mLogPrefix.c_str(), block->getBlockId(), block->getHash(),
+            canOffload ? "true" : "false",
+            mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel));
     }
 
     // True priority eviction: detach ONLY this block from the lookup tree.
@@ -2114,6 +2131,120 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
 
         results.push_back(CacheLookupResult{
             blockHash, true, requestedTier, std::int32_t{requestedTierBlock->getBlockId()}, slotIdx});
+    }
+
+    return results;
+}
+
+std::vector<CacheLookupResult> WindowBlockManager::forceOffloadAndPinBlocksByHash(
+    std::vector<size_t> const& blockHashes)
+{
+    std::vector<CacheLookupResult> results;
+    results.reserve(blockHashes.size());
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    for (auto const blockHash : blockHashes)
+    {
+        BlockPtr foundBlock;
+
+        for (auto const& block : mAllBlocksById)
+        {
+            if (block == nullptr || block->isPlaceholder())
+            {
+                continue;
+            }
+            if (block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+            {
+                continue;
+            }
+            // A block "caches" a hash only while attached to the lookup tree.
+            if (block->getLookupNode() == nullptr)
+            {
+                continue;
+            }
+            if (block->getHash() != blockHash)
+            {
+                continue;
+            }
+            foundBlock = block;
+            break;
+        }
+
+        if (foundBlock == nullptr)
+        {
+            // Block not found at all — miss.
+            results.push_back(CacheLookupResult{
+                blockHash, false, std::nullopt, std::int32_t{-1}, SizeType32{-1}});
+            break;
+        }
+
+        auto const blockTier = foundBlock->isPrimary() ? CachePoolTier::kPrimary : CachePoolTier::kHostPinned;
+        if (blockTier == CachePoolTier::kHostPinned)
+        {
+            // Already in secondary — just pin it (same as findAndPinBlocksByHash).
+            if (!foundBlock->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(
+                    foundBlock, foundBlock->getPriority(), foundBlock->getDurationMs());
+            }
+            foundBlock->incRefCount();
+            auto const slotIdx = foundBlock->getMemoryPoolBlockIndex();
+            mTransferManager->waitForPendingWrite(slotIdx);
+            results.push_back(CacheLookupResult{
+                blockHash, true, CachePoolTier::kHostPinned, std::int32_t{foundBlock->getBlockId()}, slotIdx});
+            continue;
+        }
+
+        // Block is in primary — force-offload to secondary, then pin.
+        if (mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) == 0)
+        {
+            // No free secondary slots — cannot offload.
+            results.push_back(CacheLookupResult{
+                blockHash, false, CachePoolTier::kPrimary, std::int32_t{-1}, SizeType32{-1}});
+            break;
+        }
+
+        // Claim the primary block from the free queue if it is unpinned.
+        if (!foundBlock->hasRefs())
+        {
+            mEvictionPolicy->claimBlock(
+                foundBlock, foundBlock->getPriority(), foundBlock->getDurationMs());
+        }
+
+        // Get and claim a free secondary block.
+        auto offloadTarget = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+        mEvictionPolicy->claimBlock(offloadTarget);
+
+        // Copy data from primary (foundBlock) to secondary (offloadTarget).
+        mTransferManager->offload(
+            foundBlock, offloadTarget, mPools, 0, executor::KvCacheTransferMode::kLOCAL, "");
+
+        // Swap memory pool offsets: foundBlock becomes secondary, offloadTarget becomes primary.
+        foundBlock->swapMemoryPoolBlockOffset(offloadTarget);
+
+        if (mEventManager && blockInRadixTree(foundBlock))
+        {
+            mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(foundBlock->getHash())
+                                                   .cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel)
+                                                   .slotIdxUpdated(foundBlock->getMemoryPoolBlockIndex())
+                                                   .withBlockId(foundBlock->getBlockId()),
+                mWindowSize);
+        }
+
+        // offloadTarget now holds primary memory — release it back to primary free queue.
+        mEvictionPolicy->releaseBlock(offloadTarget);
+
+        // foundBlock is now secondary and claimed. Pin it.
+        foundBlock->incRefCount();
+        auto const slotIdx = foundBlock->getMemoryPoolBlockIndex();
+        mTransferManager->waitForPendingWrite(slotIdx);
+
+        // Release foundBlock to secondary free queue so it is tracked properly,
+        // but it stays pinned due to refcount > 0.
+        mEvictionPolicy->releaseBlock(foundBlock);
+
+        results.push_back(CacheLookupResult{
+            blockHash, true, CachePoolTier::kHostPinned, std::int32_t{foundBlock->getBlockId()}, slotIdx});
     }
 
     return results;

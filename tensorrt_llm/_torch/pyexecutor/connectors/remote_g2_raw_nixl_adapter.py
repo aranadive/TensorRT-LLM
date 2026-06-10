@@ -107,6 +107,12 @@ def build_raw_nixl_source_agent(
     # fall back to the default 8888.
     listen_port = _extract_listen_port_from_metadata(metadata) or 8888
 
+    logging.info(
+        "[NIXL-XFER] source_agent_ready: agent=%s ip=%s port=%d "
+        "pool_base=0x%x pool_size=%d",
+        agent_name, local_ip, listen_port,
+        pool_base_ptr, pool_size_bytes,
+    )
     return _NixlSourceHandle(
         agent=agent,
         agent_name=agent_name,
@@ -192,6 +198,12 @@ class RawNixlRemoteG2Adapter:
             self._agent.register_memory(reg_list)
             self._primary_pool_base_ptr = primary_pool_base_ptr
             self._primary_pool_size_bytes = primary_pool_size_bytes
+            logging.info(
+                "[NIXL-XFER] target_agent_ready: agent=%s "
+                "vram_pool_base=0x%x vram_pool_size=%d device_id=%d",
+                agent_name, primary_pool_base_ptr,
+                primary_pool_size_bytes, self._device_id,
+            )
         except Exception:
             logging.exception(
                 "remote_g2: raw nixl primary pool register_memory failed "
@@ -238,6 +250,14 @@ class RawNixlRemoteG2Adapter:
                 "remote_g2: add_remote_agent returned %r but expected %r",
                 loaded_name, peer_name,
             )
+        logging.info(
+            "[NIXL-XFER] peer_loaded: local_agent=%s remote_agent=%s "
+            "remote_pool_base=0x%x remote_pool_size=%d device_id=%d",
+            self._agent_name, peer_name,
+            int(source_meta.get("pool_base_ptr", 0)),
+            int(source_meta.get("pool_size_bytes", 0)),
+            self._device_id,
+        )
 
         # Local dlist: covers our entire primary VRAM pool, indexed by
         # block. We pre-built block-aligned tuples so make_prepped_xfer's
@@ -381,7 +401,22 @@ class RawNixlRemoteG2Adapter:
                 if i < len(rank_descs) and rank_descs[i] is not None:
                     src_offset = int(rank_descs[i].get("byte_offset", 0))
                 else:
-                    src_offset = int(block.source_descriptor.byte_offset)
+                    # Block not available in secondary tier on this rank.
+                    # Using rank 0's byte_offset would read from a
+                    # different rank's (possibly empty) secondary pool
+                    # causing data corruption.  Abort the transfer.
+                    raise RuntimeError(
+                        f"remote_g2: NIXL transfer aborted — source "
+                        f"rank {my_rank} does not have block {i} "
+                        f"(hash={getattr(block, 'source_block_hash', '?')}) "
+                        f"in secondary (host-pinned) tier. "
+                        f"rank_descs[{i}] is None; falling back to "
+                        f"rank 0's byte_offset would cause data "
+                        f"corruption. This indicates an asymmetric "
+                        f"offload across TP ranks — blocks were "
+                        f"offloaded to secondary on rank 0 but not "
+                        f"on rank {my_rank}."
+                    )
                 remote_indices.append(src_offset // block_size)
         else:
             # TP=1: use bound_blocks directly.
@@ -393,12 +428,18 @@ class RawNixlRemoteG2Adapter:
                 src_offset = int(block.source_descriptor.byte_offset)
                 remote_indices.append(src_offset // block_size)
 
+        source_agent_name = source_meta.get("remote_name", "unknown")
         logging.info(
-            "remote_g2: make_prepped request_id=%s blocks=%d "
-            "tp_rank=%d local_head=%d remote_head=%d",
-            record.request_id, len(local_indices), my_rank,
-            local_indices[0] if local_indices else -1,
-            remote_indices[0] if remote_indices else -1,
+            "[NIXL-XFER] prep: request_id=%s tp_rank=%d blocks=%d "
+            "source_agent=%s local_indices=%s remote_indices=%s "
+            "block_size=%d device_id=%d",
+            record.request_id, my_rank, len(local_indices),
+            source_agent_name,
+            local_indices[:4] if len(local_indices) > 4
+            else local_indices,
+            remote_indices[:4] if len(remote_indices) > 4
+            else remote_indices,
+            block_size, self._device_id,
         )
 
         if _nvtx is not None:
@@ -427,6 +468,15 @@ class RawNixlRemoteG2Adapter:
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
+        logging.info(
+            "[NIXL-XFER] submitted: request_id=%s tp_rank=%d "
+            "source_worker=%s source_agent=%s "
+            "blocks=%d initial_state=%s",
+            record.request_id, my_rank,
+            record.plan.source_worker_id,
+            source_agent_name,
+            len(local_indices), state,
+        )
         return _RawNixlTransferResult(
             agent=self._agent,
             handle=handle,
@@ -440,10 +490,23 @@ class _RawNixlTransferResult:
     handle: Any
     record: Any
     _released: bool = False
+    _logged_done: bool = False
 
     def is_completed(self) -> bool:
         state = self.agent.check_xfer_state(self.handle)
         state_str = str(state).upper()
+        if state_str in ("DONE", "SUCCESS") and not self._logged_done:
+            self._logged_done = True
+            logging.info(
+                "[NIXL-XFER] completed: request_id=%s state=%s",
+                self.record.request_id, state_str,
+            )
+        elif state_str in ("ERROR", "FAILED") and not self._logged_done:
+            self._logged_done = True
+            logging.error(
+                "[NIXL-XFER] FAILED: request_id=%s state=%s",
+                self.record.request_id, state_str,
+            )
         return state_str in ("DONE", "SUCCESS")
 
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
