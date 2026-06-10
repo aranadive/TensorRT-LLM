@@ -2217,7 +2217,7 @@ std::vector<CacheLookupResult> WindowBlockManager::forceOffloadAndPinBlocksByHas
 
         // Copy data from primary (foundBlock) to secondary (offloadTarget).
         mTransferManager->offload(
-            foundBlock, offloadTarget, mPools, 0, executor::KvCacheTransferMode::kLOCAL, "");
+            foundBlock, offloadTarget, mPools, 0, executor::KvCacheTransferMode::DRAM, "");
 
         // Swap memory pool offsets: foundBlock becomes secondary, offloadTarget becomes primary.
         foundBlock->swapMemoryPoolBlockOffset(offloadTarget);
