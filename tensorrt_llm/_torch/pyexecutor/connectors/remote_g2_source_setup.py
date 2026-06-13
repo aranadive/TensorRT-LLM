@@ -58,6 +58,66 @@ _GLOBAL_NIXL_SOURCE_BUNDLE: Optional[_NixlSourceBundle] = None
 # its local NIXL agent.
 _GLOBAL_PER_RANK_NIXL_BUNDLES: Optional[list[dict]] = None
 
+# ---------------------------------------------------------------------------
+# Prefill-pin tracker: blocks pinned by store_blocks_for_reuse(pin=True)
+# during disagg prefill termination so they survive in the radix trie
+# until the decode worker completes KV transfer (release_lease).
+#
+# Written by the executor thread (register_prefill_pins), read/popped by
+# the ZMQ REP thread (pop_prefill_pin).  Access is protected by a lock.
+#
+# Each entry stores a timestamp so stale pins (e.g. due to decode worker
+# crash / timeout) can be cleaned up periodically.
+# ---------------------------------------------------------------------------
+import time as _time
+
+_PREFILL_PIN_TTL_S = 120.0  # seconds before a prefill pin is considered stale
+
+_prefill_pin_lock = threading.Lock()
+_prefill_pinned: dict[int, float] = {}  # block_id → registration timestamp
+
+
+def register_prefill_pins(block_ids) -> None:
+    """Record block IDs pinned by store_blocks_for_reuse for disagg prefill.
+
+    Called from the executor thread after pinning blocks.  *block_ids* is the
+    list returned by ``kv_cache_manager.store_blocks_for_reuse(req, True)``.
+    """
+    now = _time.monotonic()
+    with _prefill_pin_lock:
+        for bid in block_ids:
+            _prefill_pinned[int(bid)] = now
+
+
+def pop_prefill_pin(block_id: int) -> bool:
+    """Remove *block_id* from the prefill-pin tracker.  Return True if present."""
+    with _prefill_pin_lock:
+        return _prefill_pinned.pop(int(block_id), None) is not None
+
+
+def has_prefill_pins() -> bool:
+    """Return True if there are any outstanding prefill pins."""
+    with _prefill_pin_lock:
+        return bool(_prefill_pinned)
+
+
+def sweep_stale_prefill_pins() -> list[int]:
+    """Pop and return block IDs whose prefill pin has exceeded the TTL.
+
+    Caller is responsible for unpinning the returned IDs via
+    ``kv.unpin_blocks_by_id(stale_ids)``.
+    """
+    cutoff = _time.monotonic() - _PREFILL_PIN_TTL_S
+    stale: list[int] = []
+    with _prefill_pin_lock:
+        to_remove = [
+            bid for bid, ts in _prefill_pinned.items() if ts < cutoff
+        ]
+        for bid in to_remove:
+            del _prefill_pinned[bid]
+            stale.append(bid)
+    return stale
+
 
 def get_nixl_source_bundle() -> Optional[_NixlSourceBundle]:
     return _GLOBAL_NIXL_SOURCE_BUNDLE
@@ -178,12 +238,16 @@ def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str
 
 def _query_sibling_rank(
     dynamo_pid: int, sibling_rank: int, tp_size: int, block_hashes: list[int],
+    lease_id: str = "",
 ) -> list[dict]:
     """Query a sibling TP rank's ZMQ REP for descriptors via intra-pod IPC.
 
     Returns a list of descriptor dicts (one per block_hash, None entries
     for blocks not found on that rank). Sub-millisecond — Unix domain
     socket on the same pod.
+
+    ``lease_id`` is passed through so the sibling can track pinned
+    block_ids under the lease (Fix 2: lease-scoped sibling tracker).
     """
     import zmq
 
@@ -196,7 +260,10 @@ def _query_sibling_rank(
         req.connect(f"ipc://{sibling_path}")
         req.send(pickle.dumps({
             "method": "resolve_hashes",
-            "payload": {"block_hashes": block_hashes},
+            "payload": {
+                "block_hashes": block_hashes,
+                "lease_id": lease_id,
+            },
         }))
         raw = req.recv()
         resp = pickle.loads(raw)
@@ -219,11 +286,15 @@ def _query_sibling_rank(
 
 def _release_sibling_hashes(
     dynamo_pid: int, sibling_rank: int, tp_size: int, block_hashes: list[int],
+    lease_id: str = "",
 ) -> int:
-    """Send release_hashes to a sibling TP rank's ZMQ REP via intra-pod IPC.
+    """Send release_lease_pins to a sibling TP rank's ZMQ REP via intra-pod IPC.
 
     Returns the number of blocks successfully unpinned on the sibling.
     Fire-and-forget semantics: failures are logged but do not propagate.
+
+    Fix 2: Uses lease_id for lease-scoped unpin when available, falling
+    back to the legacy block_hashes path for backward compatibility.
     """
     import zmq
 
@@ -234,22 +305,31 @@ def _release_sibling_hashes(
     req.SNDTIMEO = 5000
     try:
         req.connect(f"ipc://{sibling_path}")
-        req.send(pickle.dumps({
-            "method": "release_hashes",
-            "payload": {"block_hashes": block_hashes},
-        }))
+        if lease_id:
+            # Fix 2: lease-scoped release — sibling looks up pins by
+            # lease_id instead of iterating block hashes.
+            req.send(pickle.dumps({
+                "method": "release_lease_pins",
+                "payload": {"lease_id": lease_id},
+            }))
+        else:
+            # Legacy path: release by block hashes.
+            req.send(pickle.dumps({
+                "method": "release_hashes",
+                "payload": {"block_hashes": block_hashes},
+            }))
         raw = req.recv()
         resp = pickle.loads(raw)
         if resp.get("ok"):
             return resp.get("result", 0)
         logging.warning(
-            "remote_g2: sibling rank %d release_hashes returned not-ok: %s",
+            "remote_g2: sibling rank %d release returned not-ok: %s",
             sibling_rank, resp.get("error"),
         )
         return 0
     except Exception:
         logging.exception(
-            "remote_g2: sibling rank %d release_hashes IPC failed (path=%s)",
+            "remote_g2: sibling rank %d release IPC failed (path=%s)",
             sibling_rank, sibling_path,
         )
         return 0
@@ -284,11 +364,14 @@ def _start_zmq_rep_service(
     rep = ctx.socket(zmq.REP)
     rep.bind(f"ipc://{socket_path}")
 
-    # Track blocks pinned by resolve_hashes on sibling ranks so that
-    # release_hashes can unpin them later.  Keyed by block_hash →
-    # list[block_id]; list handles concurrent resolves that pin the
-    # same hash more than once.
+    # Fix 2: Lease-scoped sibling pin tracker.  Keyed by
+    # lease_id → list[block_id].  Each lease's pins are tracked
+    # independently, eliminating hash-collision ambiguity between
+    # concurrent resolves and avoiding the dual-hash mismatch
+    # (identity hashes vs KV hashes) entirely.
+    # Legacy block_hash tracker kept temporarily for backward compat.
     from collections import defaultdict
+    sibling_pin_tracker_by_lease: dict[str, list[int]] = {}
     sibling_pin_tracker: dict[int, list[int]] = defaultdict(list)
 
     def _loop() -> None:
@@ -309,6 +392,7 @@ def _start_zmq_rep_service(
                     # primary-only blocks as CacheMiss(found_tier="primary").
                     from .remote_g2 import PinnedCacheBlock, CacheMiss
                     hashes = payload.get("block_hashes", [])
+                    resolve_lease_id = str(payload.get("lease_id", ""))
                     lookup_results = registry._find_and_pin_blocks_by_hash(
                         tuple(int(h) for h in hashes)
                     )
@@ -316,6 +400,8 @@ def _start_zmq_rep_service(
                     pinned_count = 0
                     primary_count = 0
                     missing_count = 0
+                    # Fix 2: Collect block_ids pinned under this lease.
+                    lease_pinned_block_ids: list[int] = []
                     # Collect indices of blocks that are in primary but
                     # not secondary — candidates for force-offload.
                     primary_only_indices = []
@@ -334,10 +420,11 @@ def _start_zmq_rep_service(
                                     }
                                 },
                             })
-                            # Track pin so release_hashes can unpin later.
-                            sibling_pin_tracker[lr.block_hash].append(
-                                int(lr.block_id)
-                            )
+                            bid = int(lr.block_id)
+                            # Legacy hash-based tracker (backward compat).
+                            sibling_pin_tracker[lr.block_hash].append(bid)
+                            # Fix 2: lease-scoped tracker.
+                            lease_pinned_block_ids.append(bid)
                             pinned_count += 1
                         else:
                             descs.append(None)
@@ -376,9 +463,10 @@ def _start_zmq_rep_service(
                                             }
                                         },
                                     }
-                                    sibling_pin_tracker[int(fr["block_hash"])].append(
-                                        int(fr["block_id"])
-                                    )
+                                    bid = int(fr["block_id"])
+                                    sibling_pin_tracker[int(fr["block_hash"])].append(bid)
+                                    # Fix 2: also track under lease.
+                                    lease_pinned_block_ids.append(bid)
                                     pinned_count += 1
                                     primary_count -= 1
                                     force_ok += 1
@@ -397,6 +485,12 @@ def _start_zmq_rep_service(
                     # truncated the results.
                     while len(descs) < len(hashes):
                         descs.append(None)
+                    # Fix 2: Store pinned block_ids under lease_id so
+                    # release_lease_pins can unpin by lease, not by hash.
+                    if resolve_lease_id and lease_pinned_block_ids:
+                        sibling_pin_tracker_by_lease[resolve_lease_id] = (
+                            list(lease_pinned_block_ids)
+                        )
                     # Diagnostic: log secondary pool utilization to
                     # confirm whether blocks exist in secondary on
                     # this rank.
@@ -416,17 +510,47 @@ def _start_zmq_rep_service(
                     logging.info(
                         "remote_g2: resolve_hashes: tp_rank=%d "
                         "hashes=%d pinned=%d in_primary=%d "
-                        "missing=%d tracker_size=%d%s",
+                        "missing=%d tracker_size=%d "
+                        "lease_tracker_size=%d lease_id=%s%s",
                         tp_rank, len(hashes), pinned_count,
                         primary_count, missing_count,
                         sum(len(v) for v in sibling_pin_tracker.values()),
+                        len(sibling_pin_tracker_by_lease),
+                        resolve_lease_id or "(none)",
                         _sec_diag,
                     )
                     response = {"ok": True, "result": descs}
 
+                elif method == "release_lease_pins":
+                    # Fix 2: Lease-scoped unpin — unpin all block_ids
+                    # tracked under the given lease_id.  Replaces the
+                    # hash-based release_hashes for new resolves.
+                    release_lid = str(payload.get("lease_id", ""))
+                    block_ids = sibling_pin_tracker_by_lease.pop(
+                        release_lid, []
+                    )
+                    unpinned = 0
+                    prefill_unpinned = 0
+                    for block_id in block_ids:
+                        registry._release_pin_ref(block_id)
+                        unpinned += 1
+                        if pop_prefill_pin(block_id):
+                            registry._release_pin_ref(block_id)
+                            prefill_unpinned += 1
+                    logging.info(
+                        "remote_g2: release_lease_pins: tp_rank=%d "
+                        "lease_id=%s unpinned=%d prefill=%d "
+                        "remaining_leases=%d",
+                        tp_rank, release_lid, unpinned,
+                        prefill_unpinned,
+                        len(sibling_pin_tracker_by_lease),
+                    )
+                    response = {"ok": True, "result": unpinned}
+
                 elif method == "release_hashes":
-                    # Intra-pod unpin from rank 0: unpin blocks that
-                    # were pinned during an earlier resolve_hashes call.
+                    # Legacy intra-pod unpin from rank 0: unpin blocks
+                    # by block_hash.  Kept for backward compatibility
+                    # with resolves that didn't pass lease_id.
                     hashes = payload.get("block_hashes", [])
                     logging.info(
                         "remote_g2: release_hashes: tp_rank=%d "
@@ -436,6 +560,7 @@ def _start_zmq_rep_service(
                         sum(len(v) for v in sibling_pin_tracker.values()),
                     )
                     unpinned = 0
+                    prefill_unpinned = 0
                     for bh in hashes:
                         ids = sibling_pin_tracker.get(bh)
                         if ids:
@@ -444,10 +569,16 @@ def _start_zmq_rep_service(
                             unpinned += 1
                             if not ids:
                                 del sibling_pin_tracker[bh]
+                            # Also unpin the prefill-time
+                            # store_blocks_for_reuse pin if present.
+                            if pop_prefill_pin(block_id):
+                                registry._release_pin_ref(block_id)
+                                prefill_unpinned += 1
                     logging.info(
                         "remote_g2: release_hashes: unpinned %d/%d "
-                        "blocks on tp_rank=%d",
+                        "blocks on tp_rank=%d (prefill_pins=%d)",
                         unpinned, len(hashes), tp_rank,
+                        prefill_unpinned,
                     )
                     response = {"ok": True, "result": unpinned}
 
@@ -495,11 +626,15 @@ def _start_zmq_rep_service(
                             for d in result.descriptors
                         ]}
                         # Query each sibling rank via local ZMQ IPC.
+                        # Fix 2: pass lease_id so siblings track pins
+                        # per-lease instead of per-hash.
+                        resolve_lease_id = str(result.lease_id or "")
                         for sibling in range(tp_size):
                             if sibling == tp_rank:
                                 continue
                             sibling_descs = _query_sibling_rank(
                                 dynamo_pid, sibling, tp_size, block_hashes,
+                                lease_id=resolve_lease_id,
                             )
                             if sibling_descs:
                                 per_rank_descs[sibling] = sibling_descs
@@ -562,29 +697,74 @@ def _start_zmq_rep_service(
                 elif method == "release_lease":
                     lease_id = payload["lease_id"]
                     reason = payload.get("reason", "ack")
-                    # Grab block_hashes BEFORE release consumes the lease,
-                    # so we can fan out unpin to sibling ranks.
+                    # Grab block_hashes and trtllm_pin_refs BEFORE
+                    # release consumes the lease, so we can fan out
+                    # unpin to sibling ranks and release prefill pins.
                     lease = registry.get_lease(lease_id)
                     block_hashes_to_release = (
                         list(lease.block_hashes)
                         if lease is not None else []
                     )
+                    lease_pin_refs = (
+                        list(lease.trtllm_pin_refs)
+                        if lease is not None else []
+                    )
                     completed = registry.release_lease(lease_id, reason)
+
+                    # Unpin prefill-time store_blocks_for_reuse pins
+                    # on rank 0.  The lease's trtllm_pin_refs contain
+                    # the block_ids that were pinned during
+                    # resolve_and_lease — these are the same physical
+                    # blocks that store_blocks_for_reuse pinned at
+                    # prefill termination.
+                    prefill_unpinned = 0
+                    if completed and lease_pin_refs and has_prefill_pins():
+                        prefill_to_unpin = []
+                        for bid in lease_pin_refs:
+                            if pop_prefill_pin(int(bid)):
+                                prefill_to_unpin.append(int(bid))
+                        if prefill_to_unpin:
+                            registry._kv.unpin_blocks_by_id(
+                                prefill_to_unpin)
+                            prefill_unpinned = len(prefill_to_unpin)
+
                     # Fan out unpin to sibling ranks (TP>1 only).
-                    if completed and tp_size > 1 and block_hashes_to_release:
+                    # Fix 2: pass lease_id so siblings can use the
+                    # lease-scoped tracker (release_lease_pins method).
+                    if completed and tp_size > 1:
                         for sibling in range(tp_size):
                             if sibling == tp_rank:
                                 continue
                             _release_sibling_hashes(
                                 dynamo_pid, sibling, tp_size,
                                 block_hashes_to_release,
+                                lease_id=lease_id,
                             )
                         logging.info(
                             "remote_g2: release fan-out: lease=%s, "
-                            "%d hashes to %d siblings",
+                            "%d hashes to %d siblings "
+                            "(rank0_prefill_pins=%d)",
                             lease_id, len(block_hashes_to_release),
-                            tp_size - 1,
+                            tp_size - 1, prefill_unpinned,
                         )
+                    # Periodic sweep: unpin any prefill pins that
+                    # have exceeded the TTL (decode worker may have
+                    # crashed or timed out without sending release).
+                    stale_ids = sweep_stale_prefill_pins()
+                    if stale_ids:
+                        try:
+                            registry._kv.unpin_blocks_by_id(stale_ids)
+                            logging.warning(
+                                "remote_g2: swept %d stale prefill "
+                                "pins (ttl=%.0fs) on tp_rank=%d",
+                                len(stale_ids),
+                                _PREFILL_PIN_TTL_S, tp_rank,
+                            )
+                        except Exception:
+                            logging.exception(
+                                "remote_g2: stale prefill pin "
+                                "sweep unpin failed")
+
                     response = {"ok": True, "result": completed}
                 elif method == "get_metadata":
                     bundle = get_nixl_source_bundle()

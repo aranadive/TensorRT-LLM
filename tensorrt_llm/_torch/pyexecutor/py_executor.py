@@ -21,7 +21,7 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_comm, mpi_disabled, nvtx_range,
+                                 mpi_comm, mpi_disabled, mpi_rank, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -65,7 +65,8 @@ from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
-                               ResourceManagerType, request_context)
+                               ResourceManagerType, _KV_OFFLOAD_DIAG,
+                               _kv_stats_str, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -2374,6 +2375,20 @@ class PyExecutor:
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
+                    # ── KV offload diagnostic: per-iteration summary ─────
+                    if _KV_OFFLOAD_DIAG and self.kv_cache_manager is not None:
+                        _n_ctx = scheduled_batch.num_context_requests
+                        _n_gen = scheduled_batch.num_generation_requests
+                        _n_active = len(self.active_requests)
+                        _st = _kv_stats_str(self.kv_cache_manager)
+                        print(
+                            "[KV_DIAG] rank=%d iter=%d "
+                            "ctx=%d gen=%d active=%d %s"
+                            % (self.dist.rank, self.iter_counter,
+                               _n_ctx, _n_gen, _n_active, _st),
+                            flush=True)
+                    # ─────────────────────────────────────────────────────
+
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
@@ -3476,6 +3491,61 @@ class PyExecutor:
                 if self.kv_connector_manager.request_finished(
                         req, cache_block_ids):
                     self.async_transfer_manager.start_transfer(req)
+                elif self.kv_cache_manager is not None:
+                    # remote_g2 path: request_finished returned False so
+                    # start_transfer was NOT called and blocks are NOT
+                    # stored in the radix trie.  Store them now so
+                    # they're findable by hash when the decode worker's
+                    # resolve_hashes request arrives.
+                    #
+                    # Fix 5: Use pin_blocks=True with a bounded budget
+                    # to protect blocks from eviction between trie store
+                    # and NIXL transfer.  Pins are released by the
+                    # release_lease handler (Fix 2) or swept by TTL
+                    # (120s) if the decode worker crashes.  If the
+                    # prefill-pin budget is exceeded, fall back to False.
+                    _prefill_pin_budget = int(os.environ.get(
+                        "TRTLLM_PREFILL_PIN_BUDGET", "256"))
+                    try:
+                        from .connectors.remote_g2_source_setup import (
+                            register_prefill_pins,
+                            _prefill_pinned,
+                            _prefill_pin_lock,
+                        )
+                        with _prefill_pin_lock:
+                            _current_pins = len(_prefill_pinned)
+                        _use_pin = _current_pins < _prefill_pin_budget
+                    except ImportError:
+                        _use_pin = False
+
+                    try:
+                        block_ids = (
+                            self.kv_cache_manager.store_blocks_for_reuse(
+                                req, pin_blocks=_use_pin))
+                        if _use_pin and block_ids:
+                            try:
+                                register_prefill_pins(block_ids)
+                            except Exception:
+                                pass
+                        if _KV_OFFLOAD_DIAG:
+                            print(
+                                "[KV_DIAG] rank=%d trie_store "
+                                "req_id=%d pin=%s budget=%d/%d"
+                                % (self.dist.rank,
+                                   req.py_request_id,
+                                   _use_pin,
+                                   _current_pins if _use_pin else -1,
+                                   _prefill_pin_budget),
+                                flush=True)
+                    except Exception:
+                        logger.warning(
+                            "remote_g2: trie store failed for "
+                            "request %d; blocks may not be "
+                            "findable by hash for cross-worker "
+                            "transfer",
+                            req.py_request_id,
+                            exc_info=True,
+                        )
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
@@ -3878,6 +3948,11 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        if _KV_OFFLOAD_DIAG:
+            print(
+                "[KV_DIAG] rank=%d _do_terminate_request req_id=%d"
+                % (self.dist.rank, request.py_request_id),
+                flush=True)
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
