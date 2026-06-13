@@ -686,13 +686,34 @@ def _start_zmq_rep_service(
                                 "Returning cache_miss to force fallback.",
                                 missing_ranks,
                             )
-                            # Fix 6: Rollback — release rank0 lease and
-                            # sibling pins acquired during the gather.
-                            # Without this, rank0 refs and sibling refs
-                            # leak on the cache_miss fallback path.
+                            # Fix 6: Rollback — release rank0 lease,
+                            # prefill pins, and sibling pins acquired
+                            # during the gather.  Without this, rank0
+                            # refs and sibling refs leak on the
+                            # cache_miss fallback path.
+                            _rollback_prefill = 0
                             try:
+                                # Grab pin refs before release consumes
+                                # the lease (mirrors release_lease handler).
+                                _rb_lease = registry.get_lease(
+                                    result.lease_id)
+                                _rb_pin_refs = (
+                                    list(_rb_lease.trtllm_pin_refs)
+                                    if _rb_lease is not None else [])
                                 registry.release_lease(
                                     result.lease_id, "gather_rollback")
+                                # Release prefill pins (same logic as
+                                # the normal release_lease handler).
+                                if _rb_pin_refs and has_prefill_pins():
+                                    _rb_to_unpin = []
+                                    for _bid in _rb_pin_refs:
+                                        if pop_prefill_pin(int(_bid)):
+                                            _rb_to_unpin.append(int(_bid))
+                                    if _rb_to_unpin:
+                                        registry._kv.unpin_blocks_by_id(
+                                            _rb_to_unpin)
+                                        _rollback_prefill = len(
+                                            _rb_to_unpin)
                             except Exception:
                                 logging.warning(
                                     "remote_g2: gather rollback: failed "
@@ -715,10 +736,21 @@ def _start_zmq_rep_service(
                                             "pins for lease %s",
                                             sibling, resolve_lease_id,
                                             exc_info=True)
+                            logging.info(
+                                "remote_g2: gather rollback: lease=%s "
+                                "prefill_unpinned=%d siblings=%d",
+                                result.lease_id, _rollback_prefill,
+                                tp_size - 1,
+                            )
                             # Override the result to signal cache miss
                             # so the target doesn't attempt a partial
-                            # transfer with wrong offsets.
+                            # transfer with wrong offsets.  Clear
+                            # lease_id/num_tokens so the target does not
+                            # send a duplicate release for a lease that
+                            # was already rolled back.
                             result_dict["reason"] = "cache_miss"
+                            result_dict["lease_id"] = None
+                            result_dict["num_tokens"] = 0
                             result_dict["descriptors"] = None
                             result_dict["per_rank_descriptors"] = None
                             response = {
