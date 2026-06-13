@@ -421,10 +421,16 @@ def _start_zmq_rep_service(
                                 },
                             })
                             bid = int(lr.block_id)
-                            # Legacy hash-based tracker (backward compat).
-                            sibling_pin_tracker[lr.block_hash].append(bid)
-                            # Fix 2: lease-scoped tracker.
-                            lease_pinned_block_ids.append(bid)
+                            # Fix 8: Only populate the legacy hash-based
+                            # tracker when no lease_id is available.
+                            # Otherwise the block_ids end up in BOTH
+                            # trackers and release_lease_pins won't clean
+                            # the legacy one — a later release_hashes
+                            # could double-unpin.
+                            if resolve_lease_id:
+                                lease_pinned_block_ids.append(bid)
+                            else:
+                                sibling_pin_tracker[lr.block_hash].append(bid)
                             pinned_count += 1
                         else:
                             descs.append(None)
@@ -464,9 +470,12 @@ def _start_zmq_rep_service(
                                         },
                                     }
                                     bid = int(fr["block_id"])
-                                    sibling_pin_tracker[int(fr["block_hash"])].append(bid)
-                                    # Fix 2: also track under lease.
-                                    lease_pinned_block_ids.append(bid)
+                                    # Fix 8: same as above — only populate
+                                    # one tracker to avoid double-unpin.
+                                    if resolve_lease_id:
+                                        lease_pinned_block_ids.append(bid)
+                                    else:
+                                        sibling_pin_tracker[int(fr["block_hash"])].append(bid)
                                     pinned_count += 1
                                     primary_count -= 1
                                     force_ok += 1
@@ -612,9 +621,20 @@ def _start_zmq_rep_service(
                     # Intra-pod per-rank gather: query sibling ranks
                     # via ZMQ IPC (no MPI, no dynamo RPC).
                     if tp_size > 1 and result.reason == "ok" and result.descriptors:
-                        block_hashes = [
-                            d.block_hash for d in result.descriptors
-                        ]
+                        # Fix 7: Use KV block hashes for sibling lookups,
+                        # not identity hashes from descriptors.  The
+                        # lease's block_hashes are the KV-trie hashes
+                        # that rank 0 resolved; siblings need the same
+                        # namespace for _find_and_pin_blocks_by_hash.
+                        lease = registry.get_lease(result.lease_id)
+                        if lease and lease.block_hashes:
+                            block_hashes = list(lease.block_hashes)
+                        else:
+                            # Fallback: identity hashes (legacy plans
+                            # where identity == kv hash).
+                            block_hashes = [
+                                d.block_hash for d in result.descriptors
+                            ]
                         per_rank_descs = {tp_rank: [
                             {
                                 "block_hash": d.block_hash,
@@ -666,6 +686,35 @@ def _start_zmq_rep_service(
                                 "Returning cache_miss to force fallback.",
                                 missing_ranks,
                             )
+                            # Fix 6: Rollback — release rank0 lease and
+                            # sibling pins acquired during the gather.
+                            # Without this, rank0 refs and sibling refs
+                            # leak on the cache_miss fallback path.
+                            try:
+                                registry.release_lease(
+                                    result.lease_id, "gather_rollback")
+                            except Exception:
+                                logging.warning(
+                                    "remote_g2: gather rollback: failed "
+                                    "to release rank0 lease %s",
+                                    result.lease_id, exc_info=True)
+                            if resolve_lease_id:
+                                for sibling in range(tp_size):
+                                    if sibling == tp_rank:
+                                        continue
+                                    try:
+                                        _release_sibling_hashes(
+                                            dynamo_pid, sibling, tp_size,
+                                            block_hashes,
+                                            lease_id=resolve_lease_id,
+                                        )
+                                    except Exception:
+                                        logging.warning(
+                                            "remote_g2: gather rollback: "
+                                            "failed to release sibling %d "
+                                            "pins for lease %s",
+                                            sibling, resolve_lease_id,
+                                            exc_info=True)
                             # Override the result to signal cache miss
                             # so the target doesn't attempt a partial
                             # transfer with wrong offsets.
