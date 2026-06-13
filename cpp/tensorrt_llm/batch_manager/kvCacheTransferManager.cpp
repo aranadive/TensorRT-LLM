@@ -420,6 +420,14 @@ void KVCacheTransferManager::waitForPendingWrite(kernels::KVCacheIndex::Underlyi
     mPendingWrites.erase(it);
 }
 
+void KVCacheTransferManager::waitForPendingWrite(BlockPtr const& block)
+{
+    // Fix 4: Use the same pool-qualified key that offload() used when recording
+    // the pending write, so the lookup hits correctly for secondary blocks
+    // (which have kSecondaryPoolFlag OR'd into the key).
+    waitForPendingWrite(getPendingTransferIndex(block));
+}
+
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
 {
     std::lock_guard<std::mutex> lock(mStatsMutex);

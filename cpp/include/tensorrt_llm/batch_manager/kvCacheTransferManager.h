@@ -89,7 +89,16 @@ public:
     //! otherwise the network adapter can pull the slot's pre-offload (stale) contents.
     //! No-op when there is no pending write for the slot. The pending-write entry is erased
     //! on successful synchronization so subsequent callers do not pay the cost again.
+    //!
+    //! Prefer the BlockPtr overload (Fix 4) which uses getPendingTransferIndex() to produce
+    //! a pool-qualified key, matching the keys used in onboard()/offload(). The raw slotIdx
+    //! overload is retained for backward compatibility.
     void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx);
+
+    //! \brief Pool-aware overload: derives the pool-qualified pending-transfer key from the
+    //! block's tier (primary vs secondary) via getPendingTransferIndex(), ensuring the lookup
+    //! matches the key used when the pending write was recorded in offload().
+    void waitForPendingWrite(BlockPtr const& block);
 
 private:
     friend class ::tensorrt_llm::testing::KVCacheTransferManagerTestAccess;

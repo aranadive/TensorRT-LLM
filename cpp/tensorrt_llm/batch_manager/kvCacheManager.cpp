@@ -2126,7 +2126,8 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
             // lookup-tree to secondary-slot pointer is committed at offload() time,
             // but the actual primary to secondary copy is queued on the offload
             // stream and not yet visible to a NIXL/RDMA reader.
-            mTransferManager->waitForPendingWrite(slotIdx);
+            // Fix 4: Use BlockPtr overload to get pool-qualified key matching offload().
+            mTransferManager->waitForPendingWrite(requestedTierBlock);
         }
 
         results.push_back(CacheLookupResult{
@@ -2189,7 +2190,8 @@ std::vector<CacheLookupResult> WindowBlockManager::forceOffloadAndPinBlocksByHas
             }
             foundBlock->incRefCount();
             auto const slotIdx = foundBlock->getMemoryPoolBlockIndex();
-            mTransferManager->waitForPendingWrite(slotIdx);
+            // Fix 4: Use BlockPtr overload to get pool-qualified key matching offload().
+            mTransferManager->waitForPendingWrite(foundBlock);
             results.push_back(CacheLookupResult{
                 blockHash, true, CachePoolTier::kHostPinned, std::int32_t{foundBlock->getBlockId()}, slotIdx});
             continue;
@@ -2237,11 +2239,15 @@ std::vector<CacheLookupResult> WindowBlockManager::forceOffloadAndPinBlocksByHas
         // foundBlock is now secondary and claimed. Pin it.
         foundBlock->incRefCount();
         auto const slotIdx = foundBlock->getMemoryPoolBlockIndex();
-        mTransferManager->waitForPendingWrite(slotIdx);
+        // Fix 4: Use BlockPtr overload to get pool-qualified key matching offload().
+        mTransferManager->waitForPendingWrite(foundBlock);
 
-        // Release foundBlock to secondary free queue so it is tracked properly,
-        // but it stays pinned due to refcount > 0.
-        mEvictionPolicy->releaseBlock(foundBlock);
+        // Fix 3: Do NOT release the pinned block back to the secondary free queue.
+        // A pinned block (refcount > 0) must not be in the eviction pool — otherwise
+        // a concurrent eviction could recycle the slot while NIXL is reading it.
+        // The block returns to the free queue when unpinBlocksById is called during
+        // lease release, mirroring findAndPinBlocksByHash's behavior (which calls
+        // claimBlock + incRefCount without a subsequent releaseBlock).
 
         results.push_back(CacheLookupResult{
             blockHash, true, CachePoolTier::kHostPinned, std::int32_t{foundBlock->getBlockId()}, slotIdx});
