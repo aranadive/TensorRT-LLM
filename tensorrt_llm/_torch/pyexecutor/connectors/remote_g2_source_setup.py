@@ -118,14 +118,18 @@ def should_prefill_pin(free_blocks: int, max_blocks_per_seq: int,
       ``max_blocks_per_seq`` — enough to admit one full-length request —
       so the GUARANTEED_NO_EVICT scheduler never starves.
     - Adding ``est_new_blocks`` would push the pin count past the
-      effective budget (the lesser of ``pin_budget`` and 25 % of
-      ``total_primary_blocks``).
+      effective budget (the lesser of ``pin_budget`` and
+      ``total_primary_blocks // 4``).
 
     Args:
         free_blocks: current free primary blocks from kv_cache_manager.
         max_blocks_per_seq: blocks needed for one max-length request.
         pin_budget: hard cap on total outstanding prefill pins (env var).
-        total_primary_blocks: total primary pool size for auto-cap.
+        total_primary_blocks: total block count for auto-cap.  NOTE:
+            currently sourced from get_kv_cache_stats().max_num_blocks
+            which is the total across all pools (primary + secondary),
+            not primary-only.  The auto-cap is therefore looser than
+            intended; the hard budget (default 32) governs in practice.
             When >0, effective budget = min(pin_budget,
             total_primary_blocks // 4).  Pass 0 to skip auto-cap.
         est_new_blocks: estimated blocks this request will pin.  If
@@ -136,7 +140,7 @@ def should_prefill_pin(free_blocks: int, max_blocks_per_seq: int,
     # Safety floor: keep enough free blocks for at least one max-len request.
     if free_blocks <= max_blocks_per_seq:
         return False
-    # Auto-cap: never pin more than 25 % of the primary pool.
+    # Auto-cap: total_primary_blocks // 4.  See docstring re: pool count caveat.
     effective_budget = pin_budget
     if total_primary_blocks > 0:
         effective_budget = min(pin_budget, total_primary_blocks // 4)
