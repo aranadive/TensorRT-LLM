@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -117,6 +118,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
 
     def _loop() -> None:
         while True:
+            method = "<unparsed>"
             try:
                 raw = rep.recv()
             except Exception:

@@ -132,6 +132,13 @@ def _resolve_release_lease(explicit: Optional[Callable[[str, str], bool]]):
 
 
 class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
+    requires_retryable_kv_admission = True
+    # KVCM V1 local offload/onboard is not safe under overlap scheduler.
+    # See NVBug 6293536.
+    requires_disable_overlap_scheduler = True
+    requires_disable_attention_dp = True
+    requires_uniform_attention_window = True
+
     def __init__(
         self,
         llm_args: Any,
@@ -255,6 +262,12 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 
 
 class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
+    requires_retryable_kv_admission = True
+    # Keep scheduler and worker capability flags aligned.
+    requires_disable_overlap_scheduler = True
+    requires_disable_attention_dp = True
+    requires_uniform_attention_window = True
+
     def __init__(
         self,
         llm_args: Any,

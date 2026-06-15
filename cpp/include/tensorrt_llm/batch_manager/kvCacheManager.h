@@ -35,6 +35,7 @@
 #include <NvInferRuntime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -463,8 +464,9 @@ private:
     // Choice of pool is encoded into the type
     kernels::KVCacheIndex mMemoryPoolBlockIndex;
 
-    // Number of references to the block
-    SizeType32 mRefCount;
+    // Number of references to the block. Atomic because source RPC threads can pin/unpin blocks concurrently with
+    // scheduler-owned request references.
+    std::atomic<SizeType32> mRefCount;
 
     // Number of references to the block
     SizeType32 mSchedulingRefCount;
@@ -876,6 +878,24 @@ public:
         std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& numContextBlocksVec,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse);
 
+    //! \brief Phase 1 of batch addSequence: claim matching blocks without onboarding or allocation.
+    [[nodiscard]] std::vector<ClaimResult> prepareSequenceBatch(std::vector<GenerationRequest*> const& sequences,
+        std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& numContextBlocksVec,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse);
+
+    //! \brief Return true if any claimed secondary block is pinned by another API user.
+    [[nodiscard]] bool hasPinnedSecondaryClaim(std::vector<ClaimResult> const& claimResults) const;
+
+    //! \brief Roll back Phase 1 claims and per-sequence entries before Phase 2 starts.
+    void rollbackSequenceBatch(
+        std::vector<GenerationRequest*> const& sequences, std::vector<ClaimResult> const& claimResults);
+
+    //! \brief Phase 2 of batch addSequence: onboard matched blocks and allocate missing blocks.
+    [[nodiscard]] std::vector<BatchSeqStats> onboardAndAllocateSequenceBatch(
+        std::vector<GenerationRequest*> const& sequences,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, std::vector<ClaimResult>& claimResults,
+        bool isEnableBlockReuse);
+
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
@@ -1135,24 +1155,21 @@ public:
     //!   2. swap-before-DMA-commit: after a primary->secondary offload, the lookup
     //!      tree's hash-to-slot pointer is updated immediately but the underlying DMA
     //!      copy is queued on the offload stream and may not be visible to a NIXL
-    //!      reader. Host-pinned hits wait on mPendingWrites[slot] before returning.
+    //!      reader. Host-pinned hits are returned only when the pending write has
+    //!      already completed; otherwise the temporary pin is released and the block
+    //!      is reported as an unpinned result so callers can retry or fall back.
     [[nodiscard]] std::vector<CacheLookupResult> findAndPinBlocksByHash(
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    //! \brief Pin blocks by block ids directly. For each id, if the block is
-    //! currently in the eviction policy's free queue (refcount 0), claim it
-    //! out of the queue before incrementing the refcount, so the unpin path
-    //! does not create a duplicate queue entry. Multiple pins on the same
-    //! block compose via refcount: only the matching count of unpins returns
-    //! the block to the free queue.
-    //!
-    //! Returns a vector of (slot_idx, cache_level) pairs in the same order
-    //! as the input blockIds, captured after the pin succeeds. This lets
-    //! callers obtain the authoritative post-pin physical location without
-    //! a separate query that could race with an in-flight offload/onboard.
+    //! \brief Pinning by block id is intentionally disabled for now.
+    //! \details Block ids address KVCacheBlock metadata directly and can bypass
+    //! the radix-tree visibility guard used by findAndPinBlocksByHash. A detached
+    //! block must not be pinned by id after the scheduler has claimed it for reuse.
+    //! This method returns no locations until all callers can prove their block ids
+    //! are lease-scoped and cannot refer to detached or repurposed blocks.
     std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
         std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1409,12 +1426,38 @@ public:
 
     void allocatePools(bool useUvm);
 
+    //! \brief Lock the shared lookup tree for a compound block-ownership operation.
+    //! \details Lock ordering contract: when both the lookup-tree mutex and an eviction-policy
+    //!          mutex are needed, acquire the lookup-tree mutex first. Eviction-policy code must
+    //!          not call back into lookup-tree operations while holding its mutex.
+    [[nodiscard]] std::unique_lock<std::recursive_mutex> lockLookupTree()
+    {
+        return std::unique_lock<std::recursive_mutex>{mLookupTree.getMutex()};
+    }
+
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
     [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> addSequenceBatch(
         std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
         std::vector<SizeType32> const& numContextBlocksVec,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
         bool isEnableBlockReuse);
+
+    [[nodiscard]] std::vector<WindowBlockManager::ClaimResult> prepareSequenceBatch(
+        std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+        std::vector<SizeType32> const& numContextBlocksVec,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
+        bool isEnableBlockReuse);
+
+    [[nodiscard]] bool hasPinnedSecondaryClaim(
+        SizeType32 windowSize, std::vector<WindowBlockManager::ClaimResult> const& claimResults) const;
+
+    void rollbackSequenceBatch(SizeType32 windowSize, std::vector<GenerationRequest*> const& sequences,
+        std::vector<WindowBlockManager::ClaimResult> const& claimResults);
+
+    [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> onboardAndAllocateSequenceBatch(
+        std::vector<GenerationRequest*> const& sequences,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests,
+        std::vector<WindowBlockManager::ClaimResult>& claimResults, SizeType32 windowSize, bool isEnableBlockReuse);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1910,6 +1953,18 @@ public:
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
         = 0;
 
+    //! \brief Retryable variant of addSequenceBatch.
+    //! \return True if all requests were admitted. Implementations that support retryable admission may return false
+    //!         after rolling back admission, for example when a secondary block needed for onboard is pinned by another
+    //!         API user. The default preserves legacy must-admit behavior.
+    virtual bool tryAddSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+    {
+        addSequenceBatch(requestInfos, llmRequests);
+        return true;
+    }
+
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false)
         = 0;
@@ -2276,6 +2331,10 @@ public:
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
     void addSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
+
+    bool tryAddSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
 
