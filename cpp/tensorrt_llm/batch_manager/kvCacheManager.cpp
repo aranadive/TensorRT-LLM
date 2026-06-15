@@ -162,7 +162,7 @@ bool KVCacheBlock::isPlaceholder() const
 
 void KVCacheBlock::startScheduling()
 {
-    mSchedulingRefCount = mRefCount;
+    mSchedulingRefCount = mRefCount.load();
 }
 
 KVCacheBlock::IdType KVCacheBlock::getBlockId() const
@@ -254,14 +254,14 @@ void KVCacheBlock::swapMemoryPoolBlockOffset(std::shared_ptr<KVCacheBlock> other
 
 void KVCacheBlock::incRefCount()
 {
-    mRefCount++;
+    mRefCount.fetch_add(1);
 }
 
 void KVCacheBlock::decRefCount()
 {
+    auto const prev = mRefCount.fetch_sub(1);
     TLLM_CHECK_WITH_INFO(
-        hasRefs(), "Can't remove link from block (id=%d) that is not allocated", static_cast<int>(mBlockId));
-    mRefCount--;
+        prev > 0, "Can't remove link from block (id=%d) that is not allocated", static_cast<int>(mBlockId));
 }
 
 void KVCacheBlock::decSchedulingRefCount()
@@ -272,7 +272,7 @@ void KVCacheBlock::decSchedulingRefCount()
 
 bool KVCacheBlock::hasRefs() const
 {
-    return mRefCount > 0;
+    return mRefCount.load() > 0;
 }
 
 bool KVCacheBlock::isShared() const
@@ -281,7 +281,7 @@ bool KVCacheBlock::isShared() const
     // lookup tree (i.e., it is cached for reuse by future requests).
     // Note: mCachedBlocksRoot also has mLookupNode set (via setAsRoot), but it is never
     // placed in the eviction queue — enforced by an assertion in LRUEvictionPolicy::releaseBlock.
-    return mRefCount > 1 || mLookupNode != nullptr;
+    return mRefCount.load() > 1 || mLookupNode != nullptr;
 }
 
 bool KVCacheBlock::hasSchedulingRefs() const
@@ -1222,8 +1222,13 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
 {
-    // eviction policy get free primary block
-    auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel, wantPlaceholder);
+    // Hash lookup also holds the lookup-tree mutex before pinning by hash. Keep allocation victims covered from the
+    // free-queue claim through radix-tree detach so source lookup cannot pin claimed-but-not-yet-detached blocks.
+    std::lock_guard<std::recursive_mutex> allocationTreeLock(mLookupTree->getMutex());
+
+    // Atomically pop the primary/placeholder block so concurrent source RPC pins cannot observe it as free between a
+    // separate peek and removal.
+    auto [block, canOffload] = mEvictionPolicy->popFreeBlock(kPrimaryLevel, wantPlaceholder);
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
@@ -1233,40 +1238,42 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
-    if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload
-        && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload)
     {
-        // Offload block in primary memory before repurposing
-        auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
-
-        // Claim both blocks BEFORE the swap so that getCacheLevel() returns the
-        // correct pre-swap level.  Previously the claims happened after the swap,
-        // causing claimBlock to erase from the wrong per-level free queue (UB) and
-        // to modify the wrong level's free-block counter — the root cause of
-        // getNumFreeBlocks() exceeding getMaxNumBlocks() in disagg/prefill mode
-        // (GitHub #11879).
-        mEvictionPolicy->claimBlock(block);        // primary block → claimed from primary queue
-        mEvictionPolicy->claimBlock(offloadBlock); // secondary block → claimed from secondary queue
-
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
-        // swap linear block offsets (i.e. make block the offload block)
-        block->swapMemoryPoolBlockOffset(offloadBlock);
-
-        if (mEventManager && blockInRadixTree(block))
+        // Source lookup also holds the lookup-tree mutex before pinning by hash. Holding it here prevents the source
+        // RPC thread from pinning the secondary victim after it has been popped for reuse but before it is detached
+        // from the radix tree.
+        std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+        auto offloadClaim = mEvictionPolicy->tryPopFreeBlock(kSecondaryLevel);
+        if (offloadClaim.has_value())
         {
-            mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(block->getHash())
-                                                   .cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel)
-                                                   .slotIdxUpdated(block->getMemoryPoolBlockIndex())
-                                                   .withBlockId(block->getBlockId()),
-                mWindowSize);
+            // Offload block in primary memory before repurposing.
+            auto offloadBlock = std::get<0>(*offloadClaim);
+
+            if (mEventManager && blockInRadixTree(offloadBlock))
+            {
+                mEventManager->enqueueRemovedEvent(offloadBlock, mWindowSize);
+            }
+            offloadBlock->detachFromLookupNode();
+
+            mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+            // swap linear block offsets (i.e. make block the offload block)
+            block->swapMemoryPoolBlockOffset(offloadBlock);
+
+            if (mEventManager && blockInRadixTree(block))
+            {
+                mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(block->getHash())
+                                                       .cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel)
+                                                       .slotIdxUpdated(block->getMemoryPoolBlockIndex())
+                                                       .withBlockId(block->getBlockId()),
+                    mWindowSize);
+            }
+            // Release block (now secondary after swap) into secondary block queue, preserving its existing priority.
+            mEvictionPolicy->releaseBlock(block);
+            // offloadBlock (now primary after swap) is already popped. The final claimBlock() below will be a no-op
+            // for the queue but still applies the caller's priority/durationMs.
+            block = offloadBlock;
         }
-        // Release block (now secondary after swap) into secondary block queue,
-        // preserving its existing priority.
-        mEvictionPolicy->releaseBlock(block);
-        // offloadBlock (now primary after swap) is already claimed above.
-        // The final claimBlock() below will be a no-op for the queue but still
-        // applies the caller's priority/durationMs.
-        block = offloadBlock;
     }
 
     // True priority eviction: detach ONLY this block from the lookup tree.
@@ -1286,7 +1293,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         }
         block->detachFromLookupNode();
     }
-    // Claim the block in primary block queue
+    // The selected block has already been popped from an eviction free queue; this applies the new
+    // request's retention metadata.
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
@@ -1349,11 +1357,31 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
 {
     if (!offloadBlock->isPlaceholder() && !offloadBlock->isPrimary())
     {
+        {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            // Defensive check: the retryable path handles pinned secondary claims before Phase 2, and the
+            // single-window path holds the lookup-tree lock across admission. Reaching this means that
+            // invariant changed.
+            TLLM_CHECK_WITH_INFO(!offloadBlock->hasRefs(),
+                "Cannot onboard secondary block %d while it is pinned by another API user",
+                static_cast<int>(offloadBlock->getBlockId()));
+        }
+
         auto block = getFreeBlock(
             sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
         mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
-        // swap linear block offsets (i.e. make block the offload block and vice versa)
-        offloadBlock->swapMemoryPoolBlockOffset(block);
+        {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            // Defensive check before committing the metadata swap. Turning this into a retry path would need
+            // explicit rollback for the allocated primary block and any queued transfer work.
+            TLLM_CHECK_WITH_INFO(!offloadBlock->hasRefs(),
+                "Cannot finish onboarding secondary block %d after it was pinned by another API user",
+                static_cast<int>(offloadBlock->getBlockId()));
+            // swap linear block offsets (i.e. make block the offload block and vice versa)
+            offloadBlock->swapMemoryPoolBlockOffset(block);
+            mEvictionPolicy->releaseBlockUnlocked(block); // append block to offload queue
+                                                          // offloadBlock is now in primary memory pool
+        }
 
         if (mEventManager)
         {
@@ -1363,8 +1391,6 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
                                                    .withBlockId(offloadBlock->getBlockId()),
                 mWindowSize);
         }
-        mEvictionPolicy->releaseBlock(block); // append block to offload queue
-                                              // offloadBlock is now in primary memory pool
     }
 }
 
@@ -1385,10 +1411,21 @@ void WindowBlockManager::offloadBlock(
     // to the eviction policy.
     if (!block->isPlaceholder() && block->isPrimary())
     {
-        // Offload block in primary memory before repurposing
-        auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
-        // If we're swapping a block to secondary memory, maintain the prior priority values.
-        mEvictionPolicy->claimBlock(offloadBlock);
+        std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+        auto offloadClaim = mEvictionPolicy->tryPopFreeBlock(kSecondaryLevel);
+        if (!offloadClaim.has_value())
+        {
+            return;
+        }
+
+        // Offload block in primary memory before repurposing.
+        auto offloadBlock = std::get<0>(*offloadClaim);
+        if (mEventManager && blockInRadixTree(offloadBlock))
+        {
+            mEventManager->enqueueRemovedEvent(offloadBlock, mWindowSize);
+        }
+        offloadBlock->detachFromLookupNode();
+
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
@@ -1791,9 +1828,13 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                 copySource, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
             // Release the claimed non-leaf copy source back to the free queue now that
             // the copy is done. The tracker ensures only the last copier releases.
-            if (claimed.shouldReleaseCopySource && !copySource->hasRefs())
+            if (claimed.shouldReleaseCopySource)
             {
-                mEvictionPolicy->releaseBlock(copySource);
+                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+                if (!copySource->hasRefs())
+                {
+                    mEvictionPolicy->releaseBlockUnlocked(copySource);
+                }
             }
             claimed.block = newBlock;
             if (blockItr != claimResult.blockKeys.end())
@@ -2020,16 +2061,14 @@ WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
     return result;
 }
 
-std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
+std::vector<WindowBlockManager::ClaimResult> WindowBlockManager::prepareSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
 {
     auto const n = sequences.size();
     std::vector<ClaimResult> claimResults(n);
-    std::vector<BatchSeqStats> results(n);
 
-    // Hold the lock for the entire two-phase operation.
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
     if (isEnableBlockReuse)
@@ -2055,6 +2094,87 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         }
     }
 
+    return claimResults;
+}
+
+bool WindowBlockManager::hasPinnedSecondaryClaim(std::vector<ClaimResult> const& claimResults) const
+{
+    for (auto const& claimResult : claimResults)
+    {
+        for (auto const& claimed : claimResult.claimedBlocks)
+        {
+            auto const& block = claimed.block;
+            if (block == nullptr || claimed.isPlaceholder || claimed.isTraversalOnly || block->isPlaceholder())
+            {
+                continue;
+            }
+            if (!block->isPrimary() && block->hasRefs())
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void WindowBlockManager::rollbackSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<ClaimResult> const& claimResults)
+{
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    std::set<KVCacheBlock::IdType> releasedBlockIds;
+    for (auto const& claimResult : claimResults)
+    {
+        for (auto const& claimed : claimResult.claimedBlocks)
+        {
+            auto const& block = claimed.block;
+            if (block == nullptr || claimed.isPlaceholder || claimed.isTraversalOnly || block->isPlaceholder())
+            {
+                continue;
+            }
+
+            auto const blockId = block->getBlockId();
+            if (releasedBlockIds.insert(blockId).second)
+            {
+                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+                if (!block->hasRefs())
+                {
+                    mEvictionPolicy->releaseBlockUnlocked(block);
+                }
+            }
+        }
+    }
+
+    for (auto* sequence : sequences)
+    {
+        auto const requestId = sequence->getRequestId();
+        auto seqIt = mAllocatedBlocksPerSeq.find(requestId);
+        if (seqIt == mAllocatedBlocksPerSeq.end())
+        {
+            continue;
+        }
+        TLLM_CHECK_WITH_INFO(seqIt->second.empty(),
+            "%s::rollbackSequenceBatch called after request %lu had blocks added", mLogPrefix.c_str(), requestId);
+        mAllocatedBlocksPerSeq.erase(seqIt);
+        sequence->clearCacheBlocks(mWindowSize);
+    }
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::onboardAndAllocateSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, std::vector<ClaimResult>& claimResults,
+    bool isEnableBlockReuse)
+{
+    auto const n = sequences.size();
+    std::vector<BatchSeqStats> results(n);
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    if (hasPinnedSecondaryClaim(claimResults))
+    {
+        return {};
+    }
+
     // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
     for (size_t i = 0; i < n; ++i)
     {
@@ -2077,6 +2197,21 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     // (held by the reuser or full-matcher), so they would be skipped anyway.
 
     return results;
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
+{
+    auto claimResults
+        = prepareSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+    if (hasPinnedSecondaryClaim(claimResults))
+    {
+        rollbackSequenceBatch(sequences, claimResults);
+        return {};
+    }
+    return onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, isEnableBlockReuse);
 }
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
@@ -2159,27 +2294,42 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
             continue;
         }
 
-        // Atomic pin (claim from free queue + refcount bump) under the lookup mutex,
-        // mirroring pinBlocksById's body but inlined here so the bump cannot race
-        // against an eviction that observes the block momentarily unpinned.
-        if (!requestedTierBlock->hasRefs())
+        SizeType32 slotIdx;
         {
-            mEvictionPolicy->claimBlock(
-                requestedTierBlock, requestedTierBlock->getPriority(), requestedTierBlock->getDurationMs());
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            if (!requestedTierBlock->hasRefs())
+            {
+                mEvictionPolicy->claimBlockUnlocked(
+                    requestedTierBlock, requestedTierBlock->getPriority(), requestedTierBlock->getDurationMs());
+            }
+            requestedTierBlock->incRefCount();
+
+            // Capture the post-pin slot while the LRU mutex is held so it cannot diverge from the held pin.
+            slotIdx = requestedTierBlock->getMemoryPoolBlockIndex();
         }
-        requestedTierBlock->incRefCount();
 
-        // Capture the post-pin slot AFTER refcount bump and BEFORE releasing the
-        // lookup mutex so the returned slot cannot diverge from the held pin.
-        auto const slotIdx = requestedTierBlock->getMemoryPoolBlockIndex();
-
-        if (requestedTier == CachePoolTier::kHostPinned)
+        if (requestedTier == CachePoolTier::kHostPinned
+            && !mTransferManager->isPendingWriteComplete(slotIdx, /*isPrimary=*/false))
         {
-            // CPU-side wait for any in-flight offload DMA targeting this slot. The
-            // lookup-tree to secondary-slot pointer is committed at offload() time,
-            // but the actual primary to secondary copy is queued on the offload
-            // stream and not yet visible to a NIXL/RDMA reader.
-            mTransferManager->waitForPendingWrite(slotIdx);
+            // The block is visible in the lookup tree, but the offload DMA into
+            // this host slot has not committed yet. Do not block the source RPC
+            // thread here: release the temporary lookup pin and let callers retry
+            // or fall back rather than returning a descriptor for stale bytes.
+            {
+                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+                requestedTierBlock->decRefCount();
+                if (!requestedTierBlock->hasRefs())
+                {
+                    mEvictionPolicy->releaseBlockUnlocked(requestedTierBlock);
+                }
+            }
+            results.push_back(CacheLookupResult{
+                blockHash, false, requestedTier, std::int32_t{-1}, SizeType32{-1}});
+            if (stopOnMiss)
+            {
+                break;
+            }
+            continue;
         }
 
         results.push_back(CacheLookupResult{
@@ -2281,6 +2431,36 @@ std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
 {
     return mWindowBlockManagers.at(windowSize)
         .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+}
+
+std::vector<WindowBlockManager::ClaimResult> BlockManager::prepareSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize, bool isEnableBlockReuse)
+{
+    return mWindowBlockManagers.at(windowSize)
+        .prepareSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+}
+
+bool BlockManager::hasPinnedSecondaryClaim(
+    SizeType32 windowSize, std::vector<WindowBlockManager::ClaimResult> const& claimResults) const
+{
+    return mWindowBlockManagers.at(windowSize).hasPinnedSecondaryClaim(claimResults);
+}
+
+void BlockManager::rollbackSequenceBatch(SizeType32 windowSize, std::vector<GenerationRequest*> const& sequences,
+    std::vector<WindowBlockManager::ClaimResult> const& claimResults)
+{
+    mWindowBlockManagers.at(windowSize).rollbackSequenceBatch(sequences, claimResults);
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> BlockManager::onboardAndAllocateSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests,
+    std::vector<WindowBlockManager::ClaimResult>& claimResults, SizeType32 windowSize, bool isEnableBlockReuse)
+{
+    return mWindowBlockManagers.at(windowSize)
+        .onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, isEnableBlockReuse);
 }
 
 void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
@@ -2432,7 +2612,10 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
         lastBlock->setHash();
 
         // balance ref count
-        lastBlock->decRefCount();
+        {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            lastBlock->decRefCount();
+        }
     }
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
@@ -2728,16 +2911,16 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
 
         if (pinBlocks)
         {
-            // If the block has no refs it sits in the eviction policy's free
-            // queue. Claim it first so that the later unpinBlocksById /
-            // releaseBlock cycle does not create a duplicate queue entry.
-            // Pass the block's existing priority and duration so that
-            // claimBlock does not clear its retention/expiry metadata.
-            if (!prevBlock->hasRefs())
+            // If the block has no refs it sits in the eviction policy's free queue. Keep the claim and refcount bump
+            // under the LRU mutex so a concurrent unpin/release cannot observe an intermediate state.
             {
-                mEvictionPolicy->claimBlock(prevBlock, prevBlock->getPriority(), prevBlock->getDurationMs());
+                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+                if (!prevBlock->hasRefs())
+                {
+                    mEvictionPolicy->claimBlockUnlocked(prevBlock, prevBlock->getPriority(), prevBlock->getDurationMs());
+                }
+                prevBlock->incRefCount();
             }
-            prevBlock->incRefCount();
             pinnedBlockIds.push_back(prevBlock->getBlockId());
         }
     }
@@ -2787,10 +2970,13 @@ void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeTyp
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
         auto block = allocatedBlocks.at(blockIdx * beamWidth + beamIdx);
-        block->decRefCount();
-        if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            block->decRefCount();
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->releaseBlockUnlocked(block);
+            }
         }
     }
 
@@ -2856,12 +3042,14 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     auto it = allocatedBlocks.rbegin();
     auto& block = *it;
-    // Decrease ref count
-    block->decRefCount();
-    // If ref count is zero, move block to free blocks
-    if (!block->hasRefs())
+    // Decrease ref count. If ref count is zero, move block to free blocks.
     {
-        mEvictionPolicy->releaseBlock(block, true);
+        std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlockUnlocked(block, true);
+        }
     }
     // Remove block from allocated blocks
     allocatedBlocks.pop_back();
@@ -3048,10 +3236,11 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
             block->decRefCount();
             if (!block->hasRefs())
             {
-                mEvictionPolicy->releaseBlock(block);
+                mEvictionPolicy->releaseBlockUnlocked(block);
             }
         }
     }
@@ -3060,42 +3249,10 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
 std::vector<std::pair<SizeType32, SizeType32>> WindowBlockManager::pinBlocksById(
     std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    std::vector<std::pair<SizeType32, SizeType32>> locations;
-    locations.reserve(blockIds.size());
-    if (blockIds.empty())
-    {
-        return locations;
-    }
-
-    static constexpr SizeType32 kPrimaryLevel = 0;
-    static constexpr SizeType32 kSecondaryLevel = 1;
-
-    for (auto const& blockId : blockIds)
-    {
-        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
-            "Block id %d is out of range", blockId);
-        auto block = mAllBlocksById[blockId];
-        if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-        {
-            // If the block has no refs it sits in the eviction policy's free
-            // queue. Claim it first so the matching unpinBlocksById /
-            // releaseBlock cycle does not create a duplicate queue entry.
-            if (!block->hasRefs())
-            {
-                mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
-            }
-            block->incRefCount();
-            // Capture the post-pin (slot, level) atomically with the pin so
-            // callers cannot observe a slot that diverges from the held pin.
-            locations.emplace_back(
-                block->getMemoryPoolBlockIndex(), block->isPrimary() ? kPrimaryLevel : kSecondaryLevel);
-        }
-        else
-        {
-            locations.emplace_back(-1, -1);
-        }
-    }
-    return locations;
+    (void) blockIds;
+    // Disabled: by-id pinning can bypass radix-tree visibility and pin a block after the scheduler has detached it
+    // for reuse. Use findAndPinBlocksByHash for cache lookups so lookup, pin, and pending-write checks stay atomic.
+    return {};
 }
 
 // Only in TRT path
@@ -3262,17 +3419,19 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
-        // Decrease ref count
-        if (block->hasRefs())
         {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
             // An out-of-window block may not have any ref count.
-            block->decRefCount();
-        }
-        // If ref count is zero, move block to free blocks. Placeholder blocks have
-        // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
-        if (!block->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(block);
+            if (block->hasRefs())
+            {
+                block->decRefCount();
+            }
+            // If ref count is zero, move block to free blocks. Placeholder blocks have mRefCount==0 and are silently
+            // ignored by EvictionPolicy::releaseBlockUnlocked().
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->releaseBlockUnlocked(block);
+            }
         }
     }
     // Remove stored block ids in sequence
@@ -3827,17 +3986,21 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         outOfWindowBlock->setDurationMs(std::nullopt);
         outOfWindowBlock->setExpirationTime(std::nullopt);
 
-        outOfWindowBlock->decRefCount();
-
-        if (outOfWindowBlock->hasRefs())
+        bool hasRefsAfterDec;
         {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            outOfWindowBlock->decRefCount();
+            hasRefsAfterDec = outOfWindowBlock->hasRefs();
+            if (!hasRefsAfterDec)
+            {
+                mEvictionPolicy->releaseBlockUnlocked(outOfWindowBlock);
+            }
+        }
 
+        if (hasRefsAfterDec)
+        {
             TLLM_LOG_DEBUG("%s::detachFrontBlock - OOW Block %d still has a non-zero ref count", mLogPrefix.c_str(),
                 outOfWindowBlock->getBlockId());
-        }
-        if (!outOfWindowBlock->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(outOfWindowBlock);
         }
     }
 
@@ -3861,14 +4024,25 @@ void KVCacheManager::addSequenceBatch(
     std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
 {
+    bool const admitted = tryAddSequenceBatch(requestInfos, llmRequests);
+    TLLM_CHECK_WITH_INFO(admitted,
+        "KVCacheManager::addSequenceBatch could not admit the request batch; use tryAddSequenceBatch for retryable "
+        "admission");
+}
+
+bool KVCacheManager::tryAddSequenceBatch(
+    std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+{
     TLLM_CHECK(requestInfos.size() == llmRequests.size());
     if (requestInfos.empty())
     {
-        return;
+        return true;
     }
     auto const n = requestInfos.size();
 
     // --- Setup: create sequences, hold them (window-independent) ---
+    auto const& windowSizesMetadata = mBlockManager.getWindowSizesMetadata();
     std::vector<GenerationRequest*> sequences(n);
 
     for (size_t i = 0; i < n; ++i)
@@ -3885,11 +4059,76 @@ void KVCacheManager::addSequenceBatch(
         {
             auto lck = std::scoped_lock(mSequencesMtx);
             return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
-                mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
+                windowSizesMetadata, kvCacheRetentionConfig);
         }();
         TLLM_CHECK(emplaceDone);
 
         sequences[i] = &seqIt->second;
+    }
+
+    std::map<SizeType32, std::vector<WindowBlockManager::ClaimResult>> claimResultsByWindow;
+    auto rollbackPreparedWindows = [&]()
+    {
+        for (auto const& [windowSize, claimResults] : claimResultsByWindow)
+        {
+            mBlockManager.rollbackSequenceBatch(windowSize, sequences, claimResults);
+        }
+
+        auto lck = std::scoped_lock(mSequencesMtx);
+        for (auto const& requestInfo : requestInfos)
+        {
+            mSequences.erase(std::get<0>(requestInfo));
+        }
+    };
+
+    std::unique_lock<std::recursive_mutex> singleWindowAdmissionLock;
+    if (windowSizesMetadata.size() == 1)
+    {
+        // Keep source-side findAndPinBlocksByHash from pinning a block after Phase 1
+        // has claimed it but before Phase 2 commits or rolls back the admission.
+        // Multi-window layouts keep the existing per-window locking; remote-G2 rejects
+        // those layouts before it can rely on retryable admission.
+        // This outer lock may nest eviction-policy locks in lower helpers; keep that
+        // order one-way (lookup tree before eviction policy).
+        // This scope is intentionally conservative: onboarding is still performed
+        // under the lookup-tree lock so a source RPC cannot lease a secondary block
+        // while scheduler admission is moving it into the request. A future refactor
+        // could mark claimed blocks as transitioning under this lock, release it while
+        // enqueueing the copy, then reacquire it to commit metadata.
+        singleWindowAdmissionLock = mBlockManager.lockLookupTree();
+    }
+
+    // --- Phase 1: claim reusable blocks for all windows without publishing them to requests. ---
+    for (auto const& [windowSize, metadata] : windowSizesMetadata)
+    {
+        // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
+        // For SWA, blocks are allocated linearly for the full prompt; out-of-window blocks are
+        // only detached during generation in adjustBlocksIfNeeded.
+        auto const maxTokenNum = metadata.maxTokenNum;
+
+        std::vector<SizeType32> inputLengths(n);
+        std::vector<SizeType32> numContextBlocksVec(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto const inputLength = std::get<1>(requestInfos[i]);
+            inputLengths[i] = std::min(inputLength, maxTokenNum);
+            numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
+        }
+
+        auto claimResults = mBlockManager.prepareSequenceBatch(
+            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
+        bool const hasPinnedSecondaryClaim = mBlockManager.hasPinnedSecondaryClaim(windowSize, claimResults);
+        bool const inserted = claimResultsByWindow.emplace(windowSize, std::move(claimResults)).second;
+        TLLM_CHECK(inserted);
+
+        if (hasPinnedSecondaryClaim)
+        {
+            rollbackPreparedWindows();
+            TLLM_LOG_DEBUG("KVCacheManager::tryAddSequenceBatch: skipping %zu request(s) because a claimed "
+                           "secondary block is pinned",
+                n);
+            return false;
+        }
     }
 
     // Track the minimum prepopulated length across all windows per sequence
@@ -3901,32 +4140,25 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalReusedDelta(n, 0);
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
-    // --- Iterate over all window sizes (single iteration for non-VSWA) ---
+    // --- Phase 2: onboard and allocate all prepared windows. ---
     // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
     // (longer windows can match longer tokens). Linear attention also benefits because it
     // has more restrictions and is always the shortest match.
-    for (auto iter = mBlockManager.getWindowSizesMetadata().rbegin();
-         iter != mBlockManager.getWindowSizesMetadata().rend(); ++iter)
+    for (auto iter = windowSizesMetadata.rbegin(); iter != windowSizesMetadata.rend(); ++iter)
     {
-        auto const& [windowSize, metadata] = *iter;
-        // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
-        // For SWA, blocks are allocated linearly for the full prompt; out-of-window blocks are
-        // only detached during generation in adjustBlocksIfNeeded.
-        auto const maxTokenNum = metadata.maxTokenNum;
-
-        // Compute per-sequence effective input length for this window
-        std::vector<SizeType32> inputLengths(n);
-        std::vector<SizeType32> numContextBlocksVec(n);
-        for (size_t i = 0; i < n; ++i)
+        auto const windowSize = iter->first;
+        auto& claimResults = claimResultsByWindow.at(windowSize);
+        auto const windowResults
+            = mBlockManager.onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, windowSize,
+                mEnableBlockReuse);
+        if (windowResults.empty())
         {
-            auto const inputLength = std::get<1>(requestInfos[i]);
-            inputLengths[i] = std::min(inputLength, maxTokenNum);
-            numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
+            rollbackPreparedWindows();
+            TLLM_LOG_DEBUG("KVCacheManager::tryAddSequenceBatch: retrying %zu request(s) because a secondary "
+                           "block became pinned before onboarding",
+                n);
+            return false;
         }
-
-        // Two-phase claim-then-onboard for this window
-        auto const windowResults = mBlockManager.addSequenceBatch(
-            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3940,6 +4172,11 @@ void KVCacheManager::addSequenceBatch(
             totalReusedDelta[i] += stats.reusedDelta;
             totalMissedDelta[i] += stats.missedDelta;
         }
+    }
+
+    if (singleWindowAdmissionLock.owns_lock())
+    {
+        singleWindowAdmissionLock.unlock();
     }
 
     // --- Finalize: set prepopulated length and per-request stats ---
@@ -3962,6 +4199,8 @@ void KVCacheManager::addSequenceBatch(
         llmRequest.updateReusedBlocksPerRequest(totalReusedDelta[i]);
         llmRequest.updateMissedBlocksPerRequest(totalMissedDelta[i]);
     }
+
+    return true;
 }
 
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)

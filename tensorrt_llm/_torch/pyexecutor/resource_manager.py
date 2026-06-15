@@ -707,19 +707,39 @@ class KVCacheManager(BaseResourceManager):
                         batch_llm_requests.append(req)
                         batch_ctx_requests.append(req)
 
+            skipped_context_requests = []
             if batch_request_infos:
-                self.impl.add_sequence_batch(batch_request_infos,
-                                             batch_llm_requests)
-                for req in batch_ctx_requests:
-                    for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
-                    for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+                if self._requires_retryable_kv_admission():
+                    admitted = self.impl.try_add_sequence_batch(
+                        batch_request_infos, batch_llm_requests)
+                else:
+                    self.impl.add_sequence_batch(batch_request_infos,
+                                                 batch_llm_requests)
+                    admitted = True
+                if admitted:
+                    for req in batch_ctx_requests:
+                        for _ in range(self.num_extra_kv_tokens):
+                            self.impl.add_token(req.py_request_id)
+                        for _ in range(get_draft_token_length(req)):
+                            self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
-                        block_ids = self.get_cache_indices(req)
-                        self.kv_connector_manager.update_state_after_alloc(
-                            req, block_ids)
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+                else:
+                    skipped_context_requests = batch_ctx_requests
+                    skipped_request_ids = {
+                        req.py_request_id
+                        for req in skipped_context_requests
+                    }
+                    scheduled_batch.reset_context_requests([
+                        req for req in scheduled_batch.context_requests
+                        if req.py_request_id not in skipped_request_ids
+                    ])
+                    logger.debug(
+                        "Skipping %d context request(s) this tick because a remote-G2 pin holds a secondary KV block",
+                        len(skipped_context_requests))
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -750,12 +770,18 @@ class KVCacheManager(BaseResourceManager):
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
+        return skipped_context_requests
+
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """No-op for V1; interface kept consistent with V2."""
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
+
+    def _requires_retryable_kv_admission(self) -> bool:
+        return (self.kv_connector_manager is not None
+                and self.kv_connector_manager.requires_retryable_kv_admission)
 
     def add_dummy_requests(
         self,
@@ -2170,9 +2196,13 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        skipped_context_requests = []
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                result = resource_manager.prepare_resources(scheduled_batch)
+                if result:
+                    skipped_context_requests.extend(result)
+        return skipped_context_requests
 
     @nvtx_range("update_resources")
     def update_resources(

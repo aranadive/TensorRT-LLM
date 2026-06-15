@@ -766,6 +766,25 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
+            if (self.kv_connector_manager.requires_disable_overlap_scheduler
+                    and not self.disable_overlap_scheduler):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires disable_overlap_scheduler=True; "
+                    "overlap scheduler retryable KV admission is not validated.")
+
+            if (self.kv_connector_manager.requires_disable_attention_dp
+                    and self.enable_attention_dp):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires enable_attention_dp=False; "
+                    "attention-DP retryable KV admission is not validated.")
+
+            if (self.kv_connector_manager.requires_uniform_attention_window
+                    and (getattr(self.kv_cache_manager, 'is_vswa', False)
+                         or getattr(self.kv_cache_manager, 'is_linear_attention', False))):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires a single non-linear attention window; "
+                    "VSWA and linear-attention KV cache layouts are not validated.")
+
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             # Start the remote-G2 source-side service here, in the engine
             # subprocess where kv_cache_manager is directly reachable. The
@@ -2530,6 +2549,19 @@ class PyExecutor:
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
+    def _prepare_resources_and_check_forward_ready(self, scheduled_batch):
+        skipped_context_requests = self.resource_manager.prepare_resources(
+            scheduled_batch) or []
+        for req in skipped_context_requests:
+            self.inflight_req_ids.erase(req.request_id)
+
+        can_queue, can_queue_this_rank = self._can_queue(scheduled_batch)
+        if skipped_context_requests and scheduled_batch.batch_size == 0:
+            logger.debug(
+                "Skipping forward because no scheduled requests were admitted this tick"
+            )
+        return can_queue, can_queue_this_rank
+
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -2915,7 +2947,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    can_queue, _ = self._prepare_resources_and_check_forward_ready(
+                        scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -2926,6 +2959,8 @@ class PyExecutor:
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
                     can_queue, _ = self._can_queue(scheduled_batch)
+                    if scheduled_batch.batch_size == 0:
+                        can_queue = False
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
@@ -3307,7 +3342,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    can_queue, can_queue_this_rank = self._prepare_resources_and_check_forward_ready(
+                        scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()

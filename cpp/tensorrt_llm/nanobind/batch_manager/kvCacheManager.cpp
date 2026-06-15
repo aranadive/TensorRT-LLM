@@ -503,6 +503,31 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 self.addSequenceBatch(requestInfos, llmRequests);
             },
             nb::arg("request_infos"), nb::arg("llm_requests"))
+        .def(
+            "try_add_sequence_batch",
+            [](tbk::BaseKVCacheManager& self, nb::list requestInfosList, nb::list llmRequestsList)
+            {
+                // Marshal Python inputs while GIL is held.
+                std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> requestInfos;
+                std::vector<std::reference_wrapper<tb::LlmRequest>> llmRequests;
+                requestInfos.reserve(nb::len(requestInfosList));
+                llmRequests.reserve(nb::len(llmRequestsList));
+                for (size_t i = 0; i < nb::len(requestInfosList); ++i)
+                {
+                    auto info = nb::cast<nb::tuple>(requestInfosList[i]);
+                    requestInfos.emplace_back(nb::cast<tb::LlmRequest::RequestIdType>(info[0]),
+                        nb::cast<SizeType32>(info[1]), nb::cast<SizeType32>(info[2]));
+                    llmRequests.push_back(std::ref(nb::cast<tb::LlmRequest&>(llmRequestsList[i])));
+                }
+                // Release GIL only for the C++ call.
+                bool admitted;
+                {
+                    nb::gil_scoped_release release;
+                    admitted = self.tryAddSequenceBatch(requestInfos, llmRequests);
+                }
+                return admitted;
+            },
+            nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("truncate_blocks", &BaseKVCacheManager::truncateBlocks, nb::call_guard<nb::gil_scoped_release>())
@@ -700,8 +725,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 std::string const& tier, bool stop_on_miss)
             {
                 auto const requestedTier = cachePoolTierFromString(tier);
-                auto results
-                    = self.findAndPinBlocksByHash(block_hashes, requestedTier, stop_on_miss, window_size);
+                std::vector<tbk::CacheLookupResult> results;
+                {
+                    nb::gil_scoped_release release;
+                    results = self.findAndPinBlocksByHash(block_hashes, requestedTier, stop_on_miss, window_size);
+                }
                 nb::list pyResults;
                 for (auto const& result : results)
                 {

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -1129,14 +1130,16 @@ class SourceG2DescriptorRegistry:
         """
         if self._window_size is None or self._block_size_bytes <= 0:
             return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
+        lookup_hashes = [int(block_hash) for block_hash in block_hashes]
         try:
             raw_results = self._kv.find_and_pin_blocks_by_hash(
-                [int(block_hash) for block_hash in block_hashes],
+                lookup_hashes,
                 int(self._window_size),
                 tier=_CACHE_TIER_HOST_PINNED,
                 stop_on_miss=True,
             )
         except Exception:
+            logging.exception("remote_g2: find_and_pin raised n=%d", len(lookup_hashes))
             return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
 
         results: list[CacheLookupResult] = []
