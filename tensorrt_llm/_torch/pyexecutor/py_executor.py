@@ -3498,25 +3498,53 @@ class PyExecutor:
                     # they're findable by hash when the decode worker's
                     # resolve_hashes request arrives.
                     #
-                    # Fix 5: Use pin_blocks=True with a bounded budget
-                    # to protect blocks from eviction between trie store
-                    # and NIXL transfer.  Pins are released by the
-                    # release_lease handler (Fix 2) or swept by TTL
-                    # (120s) if the decode worker crashes.  If the
-                    # prefill-pin budget is exceeded, fall back to False.
+                    # Fix 5 + Fix 10: Pin blocks only when a remote
+                    # worker has actually sent a resolve_and_lease or
+                    # resolve_hashes (the "lease gate") AND the primary
+                    # pool has enough free blocks to avoid starving the
+                    # scheduler.
+                    #
+                    # Budget enforcement: the effective budget is
+                    # min(TRTLLM_PREFILL_PIN_BUDGET, total_primary//4).
+                    # We pass len(cache_block_ids) as est_new_blocks
+                    # so a single large request cannot overshoot the cap.
+                    #
+                    # Without remote resolve activity, pin_blocks=False:
+                    # blocks are stored in the trie (findable by hash)
+                    # but are evictable, so the scheduler never starves.
                     _prefill_pin_budget = int(os.environ.get(
-                        "TRTLLM_PREFILL_PIN_BUDGET", "256"))
+                        "TRTLLM_PREFILL_PIN_BUDGET", "32"))
                     try:
                         from .connectors.remote_g2_source_setup import (
                             register_prefill_pins,
-                            _prefill_pinned,
-                            _prefill_pin_lock,
+                            should_prefill_pin,
                         )
-                        with _prefill_pin_lock:
-                            _current_pins = len(_prefill_pinned)
-                        _use_pin = _current_pins < _prefill_pin_budget
+                        _free = self.kv_cache_manager.get_num_free_blocks()
+                        _max_bps = getattr(
+                            self.kv_cache_manager,
+                            'max_blocks_per_seq', 128)
+                        # Total primary pool size for auto-cap.
+                        try:
+                            _kv_stats = (
+                                self.kv_cache_manager
+                                .get_kv_cache_stats())
+                            _total_primary = getattr(
+                                _kv_stats, 'max_num_blocks', 0)
+                        except Exception:
+                            _total_primary = 0
+                        # Estimate blocks this request will pin.
+                        _est_blocks = len(cache_block_ids) \
+                            if cache_block_ids else 0
+                        _use_pin = should_prefill_pin(
+                            _free, _max_bps, _prefill_pin_budget,
+                            total_primary_blocks=_total_primary,
+                            est_new_blocks=_est_blocks)
                     except ImportError:
                         _use_pin = False
+                        _free = -1
+                        _max_bps = -1
+                        _total_primary = 0
+                        _est_blocks = 0
 
                     try:
                         block_ids = (
@@ -3524,18 +3552,44 @@ class PyExecutor:
                                 req, pin_blocks=_use_pin))
                         if _use_pin and block_ids:
                             try:
-                                register_prefill_pins(block_ids)
+                                _stale = register_prefill_pins(
+                                    block_ids)
+                                # Unpin stale blocks returned by the
+                                # periodic inline sweep (Fix 10c).
+                                if _stale:
+                                    try:
+                                        self.kv_cache_manager \
+                                            .unpin_blocks_by_id(
+                                                _stale)
+                                    except Exception:
+                                        pass
+                                    if _KV_OFFLOAD_DIAG:
+                                        print(
+                                            "[KV_DIAG] rank=%d "
+                                            "stale_sweep unpinned=%d"
+                                            % (self.dist.rank,
+                                               len(_stale)),
+                                            flush=True)
                             except Exception:
                                 pass
                         if _KV_OFFLOAD_DIAG:
                             print(
                                 "[KV_DIAG] rank=%d trie_store "
-                                "req_id=%d pin=%s budget=%d/%d"
+                                "req_id=%d pin=%s free=%d/%d "
+                                "budget=%d eff_budget=%d "
+                                "est_blks=%d total_pri=%d"
                                 % (self.dist.rank,
                                    req.py_request_id,
                                    _use_pin,
-                                   _current_pins if _use_pin else -1,
-                                   _prefill_pin_budget),
+                                   _free,
+                                   _max_bps,
+                                   _prefill_pin_budget,
+                                   min(_prefill_pin_budget,
+                                       _total_primary // 4)
+                                   if _total_primary > 0
+                                   else _prefill_pin_budget,
+                                   _est_blocks,
+                                   _total_primary),
                                 flush=True)
                     except Exception:
                         logger.warning(

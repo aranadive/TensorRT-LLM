@@ -68,6 +68,13 @@ _GLOBAL_PER_RANK_NIXL_BUNDLES: Optional[list[dict]] = None
 #
 # Each entry stores a timestamp so stale pins (e.g. due to decode worker
 # crash / timeout) can be cleaned up periodically.
+#
+# Fix 10 — lease-gated pinning: prefill pins are only applied when remote
+# resolve activity has been observed (at least one resolve_and_lease
+# received).  Without remote activity, pinning is wasteful and can starve
+# the GUARANTEED_NO_EVICT scheduler.  Additionally, pinning is refused
+# when free primary blocks drop below a safety floor to prevent OOM-style
+# stalls.
 # ---------------------------------------------------------------------------
 import time as _time
 
@@ -75,18 +82,105 @@ _PREFILL_PIN_TTL_S = 120.0  # seconds before a prefill pin is considered stale
 
 _prefill_pin_lock = threading.Lock()
 _prefill_pinned: dict[int, float] = {}  # block_id → registration timestamp
+_prefill_pin_register_count: int = 0  # monotonic; drives periodic stale sweep
+
+# ---------------------------------------------------------------------------
+# Remote-resolve activity gate for prefill pinning (Fix 10).
+#
+# Set to True by the ZMQ REP handler when the first resolve_and_lease
+# arrives from any remote worker.  Once True, never reverts — the
+# presence of remote resolvers means future blocks may be requested.
+# ---------------------------------------------------------------------------
+_remote_resolve_seen: bool = False
 
 
-def register_prefill_pins(block_ids) -> None:
+def notify_remote_resolve_seen() -> None:
+    """Mark that at least one remote resolve_and_lease has been received."""
+    global _remote_resolve_seen
+    _remote_resolve_seen = True
+
+
+def is_remote_resolve_active() -> bool:
+    """Return True if any remote resolve_and_lease has been received."""
+    return _remote_resolve_seen
+
+
+def should_prefill_pin(free_blocks: int, max_blocks_per_seq: int,
+                       pin_budget: int, total_primary_blocks: int = 0,
+                       est_new_blocks: int = 0) -> bool:
+    """Decide whether store_blocks_for_reuse should use pin_blocks=True.
+
+    Returns False (fail-open, no pin) when:
+    - No remote resolve_and_lease or resolve_hashes has ever been
+      received (no point in pinning blocks no remote worker will
+      request).
+    - Free primary blocks are at or below a safety floor.  The floor is
+      ``max_blocks_per_seq`` — enough to admit one full-length request —
+      so the GUARANTEED_NO_EVICT scheduler never starves.
+    - Adding ``est_new_blocks`` would push the pin count past the
+      effective budget (the lesser of ``pin_budget`` and 25 % of
+      ``total_primary_blocks``).
+
+    Args:
+        free_blocks: current free primary blocks from kv_cache_manager.
+        max_blocks_per_seq: blocks needed for one max-length request.
+        pin_budget: hard cap on total outstanding prefill pins (env var).
+        total_primary_blocks: total primary pool size for auto-cap.
+            When >0, effective budget = min(pin_budget,
+            total_primary_blocks // 4).  Pass 0 to skip auto-cap.
+        est_new_blocks: estimated blocks this request will pin.  If
+            current pins + est_new_blocks > effective budget, refuse.
+    """
+    if not _remote_resolve_seen:
+        return False
+    # Safety floor: keep enough free blocks for at least one max-len request.
+    if free_blocks <= max_blocks_per_seq:
+        return False
+    # Auto-cap: never pin more than 25 % of the primary pool.
+    effective_budget = pin_budget
+    if total_primary_blocks > 0:
+        effective_budget = min(pin_budget, total_primary_blocks // 4)
+    with _prefill_pin_lock:
+        current = len(_prefill_pinned)
+        if current >= effective_budget:
+            return False
+        # Prevent overshoot: refuse if this request would blow the cap.
+        if est_new_blocks > 0 and current + est_new_blocks > effective_budget:
+            return False
+    return True
+
+
+_PREFILL_SWEEP_INTERVAL = 8  # sweep every N register_prefill_pins calls
+
+
+def register_prefill_pins(block_ids) -> list[int]:
     """Record block IDs pinned by store_blocks_for_reuse for disagg prefill.
 
     Called from the executor thread after pinning blocks.  *block_ids* is the
     list returned by ``kv_cache_manager.store_blocks_for_reuse(req, True)``.
+
+    Returns a (possibly empty) list of stale block IDs whose TTL has
+    expired.  The caller **must** unpin them via
+    ``kv_cache_manager.unpin_blocks_by_id(stale_ids)`` if non-empty.
+    This ensures stale sweep runs from the executor thread even when no
+    ``release_lease`` arrives.
     """
+    global _prefill_pin_register_count
     now = _time.monotonic()
+    stale: list[int] = []
     with _prefill_pin_lock:
         for bid in block_ids:
             _prefill_pinned[int(bid)] = now
+        _prefill_pin_register_count += 1
+        # Periodic inline sweep — avoids a separate timer thread.
+        if _prefill_pin_register_count % _PREFILL_SWEEP_INTERVAL == 0:
+            cutoff = now - _PREFILL_PIN_TTL_S
+            expired = [b for b, ts in _prefill_pinned.items()
+                       if ts < cutoff]
+            for b in expired:
+                del _prefill_pinned[b]
+                stale.append(b)
+    return stale
 
 
 def pop_prefill_pin(block_id: int) -> bool:
@@ -386,6 +480,10 @@ def _start_zmq_rep_service(
                 method = req.get("method")
                 payload = req.get("payload") or {}
                 if method == "resolve_hashes":
+                    # Fix 10b: sibling ranks also see remote resolve
+                    # activity so executor-side prefill pinning is
+                    # symmetric across TP ranks.
+                    notify_remote_resolve_seen()
                     # Intra-pod query from rank 0: look up block hashes
                     # on THIS rank's registry and return descriptors.
                     # Uses the batch tier-aware lookup which reports
@@ -592,6 +690,9 @@ def _start_zmq_rep_service(
                     response = {"ok": True, "result": unpinned}
 
                 elif method == "resolve_and_lease":
+                    # Fix 10: signal that remote resolves are happening
+                    # so the executor thread enables prefill pinning.
+                    notify_remote_resolve_seen()
                     result = registry.resolve_and_lease(payload.get("plan"))
                     result_dict = _result_to_dict(result)
 
