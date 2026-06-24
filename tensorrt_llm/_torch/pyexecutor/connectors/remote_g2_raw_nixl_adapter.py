@@ -159,12 +159,13 @@ class RawNixlRemoteG2Adapter:
     def __init__(
         self,
         *,
-        source_metadata_fetcher,  # (worker_id, generation) -> dict
+        source_metadata_fetcher,  # (worker_id, generation, dp_rank) -> dict
         target_descriptor_resolver,  # (record) -> Sequence[descriptor]
         agent_name: str,
         primary_pool_base_ptr: int,
         primary_pool_size_bytes: int,
         device_id: int = 0,
+        kv_rank: int = 0,
     ):
         try:
             from nixl import nixl_agent, nixl_agent_config
@@ -181,6 +182,7 @@ class RawNixlRemoteG2Adapter:
         self._source_metadata_fetcher = source_metadata_fetcher
         self._target_descriptor_resolver = target_descriptor_resolver
         self._device_id = int(device_id)
+        self._kv_rank = int(kv_rank)
         self._block_size_bytes = 0  # set on first transfer
 
         # Pre-register the entire primary VRAM pool — sub-gap "Buffer
@@ -351,11 +353,11 @@ class RawNixlRemoteG2Adapter:
             raise RuntimeError("remote G2 record has zero-sized blocks")
         self._block_size_bytes = block_size
 
-        # T3: Determine which source rank's metadata to use.
+        # T3: Determine which source KV rank's metadata to use.
         # With TP>1, each target rank loads its corresponding source
-        # rank's NIXL agent and uses that rank's descriptors.
-        from tensorrt_llm._utils import mpi_rank as _mpi_rank
-        my_rank = _mpi_rank()
+        # rank's NIXL agent and uses that rank's descriptors. With ADP,
+        # each rank has a full KV cache, so kv_rank is always 0.
+        my_rank = self._kv_rank
 
         resolve_result = record.resolve_result
         per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})
@@ -378,6 +380,7 @@ class RawNixlRemoteG2Adapter:
                 source_meta = self._source_metadata_fetcher(
                     record.plan.source_worker_id,
                     int(record.source_generation),
+                    record.plan.source_dp_rank,
                 )
         finally:
             if _nvtx is not None:

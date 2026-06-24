@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -123,6 +123,53 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
                                                                          32)
 
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_manager_standalone_kv_group_uses_local_scheduler():
+    worker = MagicMock()
+    scheduler = MagicMock()
+    scheduler.get_num_new_matched_tokens.return_value = (16, False)
+    scheduler.request_finished.return_value = False
+    worker.get_finished.return_value = ([], [])
+
+    manager = KvCacheConnectorManager(
+        worker,
+        scheduler=scheduler,
+        kv_rank=0,
+        kv_world_size=1,
+    )
+
+    req = MagicMock()
+    req.request_id = 42
+    req.is_generation_only_request = False
+    req.is_attention_dp_dummy = False
+
+    assert manager.get_num_new_matched_tokens(req, 32) == 16
+    assert scheduler.get_num_new_matched_tokens.call_args[0] == (req, 32)
+
+    assert manager.request_finished(req, []) is False
+    assert scheduler.request_finished.call_args[0] == (req, [])
+    assert manager.get_finished() == []
+
+
+def test_connector_manager_ignores_attention_dp_dummy_requests():
+    worker = MagicMock()
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(
+        worker,
+        scheduler=scheduler,
+        kv_rank=0,
+        kv_world_size=1,
+    )
+
+    req = MagicMock()
+    req.request_id = 42
+    req.is_attention_dp_dummy = True
+
+    assert manager.get_num_new_matched_tokens(req, 32) == 0
+    assert manager.request_finished(req, []) is False
+    scheduler.get_num_new_matched_tokens.assert_not_called()
+    scheduler.request_finished.assert_not_called()
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

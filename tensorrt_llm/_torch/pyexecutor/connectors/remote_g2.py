@@ -174,14 +174,21 @@ class TargetRemotePlanStore:
         self,
         *,
         enabled: bool = True,
+        target_dp_rank: Optional[int] = None,
         clock_ms: Callable[[], int] = _now_ms,
         observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         self.enabled = enabled
+        self._target_dp_rank = target_dp_rank
         self._clock_ms = clock_ms
         self._observability = observability or NullRemoteG2ObservabilitySink()
         self._plans: dict[int | str, TargetRemotePlanEntry] = {}
         self._lock = threading.RLock()
+
+    def set_target_dp_rank(self, target_dp_rank: Optional[int]) -> None:
+        with self._lock:
+            self._target_dp_rank = target_dp_rank
+            self._plans.clear()
 
     def put(
         self, trtllm_request_id: int | str, plan: Mapping[str, Any] | RemoteKvReusePlan
@@ -218,8 +225,13 @@ class TargetRemotePlanStore:
         now_ms = self._clock_ms()
         if not parsed.is_remote_g2() or parsed.is_expired(now_ms):
             return None
-
         with self._lock:
+            if (
+                self._target_dp_rank is not None
+                and parsed.target_dp_rank != self._target_dp_rank
+            ):
+                return None
+
             self._plans[_normalize_request_id(trtllm_request_id)] = TargetRemotePlanEntry(parsed)
         self._observability.emit(
             RemoteG2LifecycleEvent(

@@ -24,6 +24,14 @@ _REMOTE_G2_OBSERVABILITY_PATH = (
     / "connectors"
     / "remote_g2_observability.py"
 )
+_REMOTE_G2_RANK_CONTEXT_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_rank_context.py"
+)
 
 
 def _install_package(name):
@@ -58,6 +66,10 @@ def _load_remote_g2_modules():
 
 
 OBSERVABILITY, _REMOTE_G2 = _load_remote_g2_modules()
+_REMOTE_G2_RANK_CONTEXT = _load_module(
+    f"{_CONNECTOR_PACKAGE}.remote_g2_rank_context",
+    _REMOTE_G2_RANK_CONTEXT_PATH,
+)
 
 
 # bind_target_blocks does a lazy `from .remote_g2_connector import
@@ -98,6 +110,7 @@ SourceG2DescriptorRecord = _REMOTE_G2.SourceG2DescriptorRecord
 SourceG2DescriptorRegistry = _REMOTE_G2.SourceG2DescriptorRegistry
 TargetRemoteG2BindingStore = _REMOTE_G2.TargetRemoteG2BindingStore
 TargetRemotePlanStore = _REMOTE_G2.TargetRemotePlanStore
+RemoteG2RankContext = _REMOTE_G2_RANK_CONTEXT.RemoteG2RankContext
 compute_remote_g2_matched_tokens = _REMOTE_G2.compute_remote_g2_matched_tokens
 InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
 RemoteG2LifecycleEvent = OBSERVABILITY.RemoteG2LifecycleEvent
@@ -148,6 +161,43 @@ def _descriptor(block_hash, generation=1):
     )
 
 
+def test_rank_context_derives_adp_as_standalone_kv_rank():
+    mapping = types.SimpleNamespace(
+        enable_attention_dp=True,
+        tp_rank=1,
+        tp_size=2,
+        rank=5,
+        tp_group=[4, 5],
+    )
+
+    ctx = RemoteG2RankContext.from_mapping(mapping, worker_id=7)
+
+    assert ctx.worker_id == 7
+    assert ctx.dp_rank == 1
+    assert ctx.kv_rank == 0
+    assert ctx.kv_world_size == 1
+    assert ctx.group_ranks == (5,)
+    assert ctx.uses_context_qualified_names
+
+
+def test_rank_context_derives_tp_as_kv_group():
+    mapping = types.SimpleNamespace(
+        enable_attention_dp=False,
+        tp_rank=1,
+        tp_size=2,
+        rank=5,
+        tp_group=[4, 5],
+    )
+
+    ctx = RemoteG2RankContext.from_mapping(mapping)
+
+    assert ctx.dp_rank == 0
+    assert ctx.kv_rank == 1
+    assert ctx.kv_world_size == 2
+    assert ctx.group_ranks == (4, 5)
+    assert not ctx.uses_context_qualified_names
+
+
 def _resolve_result(block_hashes=(11, 22, 33), num_tokens=48, lease_id="lease-1"):
     return RemoteG2ResolveResult(
         lease_id=lease_id,
@@ -167,6 +217,18 @@ def test_target_store_keys_plan_by_trtllm_request_id_and_discards():
     assert store.get("1234").source_worker_id == 7
     store.discard(1234)
     assert store.get(1234) is None
+
+
+def test_target_store_filters_by_target_dp_rank():
+    store = TargetRemotePlanStore(clock_ms=lambda: 500, target_dp_rank=1)
+
+    assert store.put(1234, _plan(target_dp_rank=2)) is None
+    assert store.put(1235, _plan(target_dp_rank=1)) is not None
+    assert store.get(1235).target_dp_rank == 1
+
+    store.set_target_dp_rank(2)
+    assert store.get(1235) is None
+    assert store.put(1236, _plan(target_dp_rank=2)) is not None
 
 
 def test_target_store_rejects_expired_or_non_g2_plan():

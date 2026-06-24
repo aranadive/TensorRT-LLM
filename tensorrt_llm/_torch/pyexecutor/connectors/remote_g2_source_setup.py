@@ -324,12 +324,21 @@ def _result_to_dict(result: Any) -> dict:
     return out
 
 
-def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str:
+def _ipc_socket_path(
+    dynamo_pid: int,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    *,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
+) -> str:
     """Return the ZMQ IPC socket path for a given TP rank.
 
     TP=1: /tmp/dynamo_remote_g2_ipc_{pid}.sock (backward-compatible)
     TP>1: /tmp/dynamo_remote_g2_ipc_{pid}_tp{rank}.sock (per-rank)
     """
+    if context_qualified:
+        return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}_dp{int(dp_rank or 0)}_kv{tp_rank}.sock"
     if tp_size <= 1:
         return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}.sock"
     return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}_tp{tp_rank}.sock"
@@ -441,6 +450,8 @@ def _start_zmq_rep_service(
     dynamo_pid: int,
     tp_rank: int = 0,
     tp_size: int = 1,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
 ) -> str:
     """Start a ZMQ REP daemon thread bound to a Unix domain socket.
 
@@ -453,7 +464,13 @@ def _start_zmq_rep_service(
     """
     import zmq
 
-    socket_path = _ipc_socket_path(dynamo_pid, tp_rank, tp_size)
+    socket_path = _ipc_socket_path(
+        dynamo_pid,
+        tp_rank,
+        tp_size,
+        dp_rank=dp_rank,
+        context_qualified=context_qualified,
+    )
     try:
         os.unlink(socket_path)
     except FileNotFoundError:
@@ -1222,6 +1239,8 @@ def _setup_nixl_source_agent(
     source_worker_id: int,
     tp_rank: int = 0,
     tp_size: int = 1,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
 ) -> Optional[_NixlSourceBundle]:
     """Build a raw nixl_agent on the source side and register the
     host_pinned secondary pool memory range so it can be read remotely.
@@ -1229,7 +1248,9 @@ def _setup_nixl_source_agent(
     With TP>1, each rank builds its own agent with a rank-qualified
     name so peers can load multiple source agents (one per TP rank).
     """
-    if tp_size > 1:
+    if context_qualified:
+        agent_name = f"remote-g2-source-{source_worker_id}-dp{int(dp_rank or 0)}-kv{tp_rank}"
+    elif tp_size > 1:
         agent_name = f"remote-g2-source-{source_worker_id}-tp{tp_rank}"
     else:
         agent_name = f"remote-g2-source-{source_worker_id}"
@@ -1389,6 +1410,9 @@ def maybe_start_remote_g2_service(
     *,
     tp_rank: int = 0,
     tp_size: int = 1,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
+    auto_detect_tp: bool = True,
     lease_ttl_ms: int = 30_000,
     pool_id: str = "g2-host-pinned",
     tier: str = "host_pinned",
@@ -1420,7 +1444,7 @@ def maybe_start_remote_g2_service(
     # Auto-detect tp_rank/tp_size from MPI when not passed explicitly.
     # This handles deployments where py_executor.py doesn't pass the
     # TP info (e.g. patched connectors without patched py_executor).
-    if tp_rank == 0 and tp_size == 1:
+    if auto_detect_tp and tp_rank == 0 and tp_size == 1:
         try:
             from tensorrt_llm._utils import mpi_rank, mpi_world_size
             detected_rank = mpi_rank()
@@ -1452,10 +1476,13 @@ def maybe_start_remote_g2_service(
     # SourceG2DescriptorRegistry it builds) talks to the C++ object
     # directly.
     kv = getattr(kv, "impl", kv)
-    try:
-        source_dp_rank = int(os.environ.get("DYNAMO_REMOTE_G2_DP_RANK", "0"))
-    except ValueError:
-        source_dp_rank = 0
+    if dp_rank is not None:
+        source_dp_rank = int(dp_rank)
+    else:
+        try:
+            source_dp_rank = int(os.environ.get("DYNAMO_REMOTE_G2_DP_RANK", "0"))
+        except ValueError:
+            source_dp_rank = 0
 
     pool_base_ptr = _secondary_pool_base_ptr(kv)
     if pool_base_ptr == 0:
@@ -1517,7 +1544,10 @@ def maybe_start_remote_g2_service(
     try:
         socket_path = _start_zmq_rep_service(
             registry, dynamo_pid,
-            tp_rank=tp_rank, tp_size=tp_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            dp_rank=source_dp_rank,
+            context_qualified=context_qualified,
         )
         logging.warning(
             "remote_g2: ZMQ REP service bound at %s "
@@ -1549,6 +1579,8 @@ def maybe_start_remote_g2_service(
             source_worker_id=source_worker_id,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            dp_rank=source_dp_rank,
+            context_qualified=context_qualified,
         )
         if bundle is not None:
             global _GLOBAL_NIXL_SOURCE_BUNDLE

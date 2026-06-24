@@ -38,6 +38,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.remote_g2_rank_context import RemoteG2RankContext
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
@@ -789,11 +790,6 @@ def create_py_executor(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
 
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
-
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -802,14 +798,30 @@ def create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
-            rank = tensorrt_llm.mpi_rank()
+            if mapping.enable_attention_dp and mapping.tp_size != 2:
+                raise NotImplementedError(
+                    "remote-G2 KV connector attention-DP support is limited "
+                    "to tensor_parallel_size=2 for now."
+                )
+
+            connector_classes = [worker_cls]
+            if scheduler_cls is not None:
+                connector_classes.append(scheduler_cls)
+            if mapping.enable_attention_dp and not all(
+                    getattr(connector_cls, "supports_attention_dp", False)
+                    for connector_cls in connector_classes):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector does not support "
+                    "attention data parallelism (enable_attention_dp=True).")
+
+            rank_ctx = RemoteG2RankContext.from_mapping(mapping)
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and rank_ctx.kv_rank == 0:
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -825,7 +837,11 @@ def create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                kv_rank=rank_ctx.kv_rank,
+                kv_world_size=rank_ctx.kv_world_size,
+            )
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

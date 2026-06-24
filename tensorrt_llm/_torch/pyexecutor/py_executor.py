@@ -728,13 +728,11 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            if self.enable_attention_dp:
+            if (self.enable_attention_dp
+                    and not self.kv_connector_manager.supports_attention_dp):
                 raise NotImplementedError(
-                    "KV Cache Connector is not supported with attention data "
-                    "parallelism (enable_attention_dp). Dummy requests "
-                    "inserted for cross-DP balancing flow through the "
-                    "connector scheduler / worker hooks and are not "
-                    "distinguished from real requests.")
+                    "The selected KV Cache Connector does not support "
+                    "attention data parallelism (enable_attention_dp=True).")
 
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
             if (kv_cache_config is not None and kv_cache_config.host_cache_size
@@ -796,14 +794,19 @@ class PyExecutor:
             # connector class stays unchanged.
             # TODO production: feature-gate via connector config rather than
             # unconditionally calling here.
+            from .connectors.remote_g2_rank_context import RemoteG2RankContext
+            rank_ctx = RemoteG2RankContext.from_mapping(self.dist.mapping)
             try:
                 from .connectors.remote_g2_source_setup import (
                     maybe_start_remote_g2_service,
                 )
                 maybe_start_remote_g2_service(
                     self.kv_cache_manager,
-                    tp_rank=self.dist.tp_rank,
-                    tp_size=self.dist.tp_size,
+                    tp_rank=rank_ctx.kv_rank,
+                    tp_size=rank_ctx.kv_world_size,
+                    dp_rank=rank_ctx.dp_rank,
+                    context_qualified=rank_ctx.uses_context_qualified_names,
+                    auto_detect_tp=False,
                 )
             except Exception:
                 import logging
@@ -816,8 +819,10 @@ class PyExecutor:
                 )
                 maybe_start_remote_g2_target_client(
                     self.kv_cache_manager,
-                    tp_rank=self.dist.tp_rank,
-                    tp_size=self.dist.tp_size,
+                    tp_rank=rank_ctx.kv_rank,
+                    tp_size=rank_ctx.kv_world_size,
+                    dp_rank=rank_ctx.dp_rank,
+                    context_qualified=rank_ctx.uses_context_qualified_names,
                 )
             except Exception:
                 import logging

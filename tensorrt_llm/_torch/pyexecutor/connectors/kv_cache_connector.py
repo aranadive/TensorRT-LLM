@@ -103,6 +103,7 @@ class KvCacheConnectorWorker(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_attention_dp = False
     supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -207,6 +208,7 @@ class KvCacheConnectorScheduler(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_attention_dp = False
     supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -391,6 +393,8 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
             if req.request_id in new_async_requests.loading_ids:
                 continue
 
@@ -410,6 +414,8 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
             )
@@ -438,9 +444,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     """
 
     def __init__(
-        self, worker: KvCacheConnectorWorker, scheduler: Optional[KvCacheConnectorScheduler]
+        self,
+        worker: KvCacheConnectorWorker,
+        scheduler: Optional[KvCacheConnectorScheduler],
+        *,
+        kv_rank: Optional[int] = None,
+        kv_world_size: Optional[int] = None,
     ):
-        assert (scheduler is not None) == (mpi_rank() == 0), (
+        self._kv_rank = mpi_rank() if kv_rank is None else int(kv_rank)
+        self._kv_world_size = (
+            None if kv_world_size is None else int(kv_world_size)
+        )
+        is_leader = self._kv_rank == 0
+        assert (scheduler is not None) == is_leader, (
             "The scheduler may only exist on rank 0!"
         )
 
@@ -501,18 +517,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def supports_host_kv_cache(self) -> bool:
         return self._connector_supports("supports_host_kv_cache")
 
+    @property
+    def supports_attention_dp(self) -> bool:
+        return self._connector_supports("supports_attention_dp")
+
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
         Run a function on the leader rank, and broadcast the result to all other ranks.
         """
+        if self._kv_world_size == 1:
+            assert self.scheduler is not None, "The scheduler must exist on a standalone KV rank!"
+            return f()
+
         if self.scheduler is not None:
-            assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
+            assert self._kv_rank == 0, "The scheduler may only exist on rank 0!"
             res = f()
         else:
             res = None
         return mpi_broadcast(res, root=0)
 
     def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+        if getattr(request, "is_attention_dp_dummy", False):
+            return 0
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -602,6 +628,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             free_resources on the request.
         """
 
+        if getattr(req, "is_attention_dp_dummy", False):
+            return False
+
         if req.request_id in self.finished_async_loading_requests:
             del self.finished_async_loading_requests[req.request_id]
 
@@ -649,7 +678,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished_saving = list(self.local_finished_async_requests.saving_ids)
         finished_loading = list(self.local_finished_async_requests.loading_ids)
 
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        if self._kv_world_size == 1:
+            all_results = [(finished_saving, finished_loading)]
+        else:
+            all_results = mpi_allgather((finished_saving, finished_loading))
 
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])

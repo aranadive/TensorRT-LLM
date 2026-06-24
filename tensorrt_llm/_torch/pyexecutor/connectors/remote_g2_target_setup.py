@@ -38,6 +38,7 @@ from .remote_g2 import (
     RemoteG2Descriptor,
     RemoteG2ResolveResult,
     RemoteKvReusePlan,
+    target_remote_g2_plan_store,
 )
 from .remote_g2_source_setup import (
     _derive_block_size_bytes,
@@ -610,6 +611,9 @@ def _build_target_nixl_adapter(
     wrapper: _TargetReqWrapper,
     kv: Any,
     own_worker_id: int,
+    tp_rank: int = 0,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
 ) -> Optional[Any]:
     """Construct the raw-nixl-based target transfer adapter.
 
@@ -669,13 +673,20 @@ def _build_target_nixl_adapter(
     # target's serialized agent metadata bytes via the metadata RPC
     # payload, so source can add_remote_agent on us BEFORE returning
     # its own metadata bytes.
-    def _raw_metadata_fetcher(source_worker_id: int, source_generation: int) -> dict:
+    def _raw_metadata_fetcher(
+        source_worker_id: int,
+        source_generation: int,
+        source_dp_rank: int = 0,
+    ) -> dict:
         import base64 as _b64
         # The local NIXL agent for the raw adapter isn't yet available
         # at this point (the adapter populates _local_peer_metadata_b64
         # on construction). We rely on the adapter setting it via the
         # shared state dict below.
-        payload = {"source_worker_id": int(source_worker_id)}
+        payload = {
+            "source_worker_id": int(source_worker_id),
+            "source_dp_rank": int(source_dp_rank),
+        }
         peer_b64 = adapter_state.get("peer_metadata_b64", "")
         if peer_b64:
             payload["peer_metadata_b64"] = peer_b64
@@ -700,7 +711,10 @@ def _build_target_nixl_adapter(
         primary_base_ptr, block_size_bytes, device_id
     )
 
-    agent_name = f"remote-g2-target-{own_worker_id}"
+    if context_qualified:
+        agent_name = f"remote-g2-target-{own_worker_id}-dp{int(dp_rank or 0)}-kv{tp_rank}"
+    else:
+        agent_name = f"remote-g2-target-{own_worker_id}"
     try:
         adapter = RawNixlRemoteG2Adapter(
             source_metadata_fetcher=_raw_metadata_fetcher,
@@ -709,6 +723,7 @@ def _build_target_nixl_adapter(
             primary_pool_base_ptr=primary_base_ptr,
             primary_pool_size_bytes=primary_pool_size_bytes,
             device_id=device_id,
+            kv_rank=tp_rank,
         )
         # Populate our own metadata bytes for the bidirectional
         # handshake so the source can add_remote_agent on us.
@@ -749,6 +764,8 @@ def maybe_start_remote_g2_target_client(
     *,
     tp_rank: int = 0,
     tp_size: int = 1,
+    dp_rank: Optional[int] = None,
+    context_qualified: bool = False,
 ) -> bool:
     """Open the engine→parent ZMQ REQ socket and install module-state
     callables on remote_g2_connector. Returns True on success, False
@@ -808,6 +825,7 @@ def maybe_start_remote_g2_target_client(
 
     remote_g2_connector.install_resolve_and_lease(resolve_fn)
     remote_g2_connector.install_release_lease(release_fn)
+    target_remote_g2_plan_store().set_target_dp_rank(dp_rank)
 
     # Install the block_id → primary-pool slot_idx lookup the binding
     # store uses to build NIXL local-dlist indices.
@@ -893,7 +911,14 @@ def maybe_start_remote_g2_target_client(
     # Mirror the source-side .impl unwrap; we need the C++ binding for
     # get_primary_pool_data + get_iteration_stats.
     kv = getattr(kv, "impl", kv)
-    adapter = _build_target_nixl_adapter(wrapper, kv, own_worker_id)
+    adapter = _build_target_nixl_adapter(
+        wrapper,
+        kv,
+        own_worker_id,
+        tp_rank=tp_rank,
+        dp_rank=dp_rank,
+        context_qualified=context_qualified,
+    )
     if adapter is None:
         logging.warning(
             "remote_g2: transfer adapter not installed (build failed); "
