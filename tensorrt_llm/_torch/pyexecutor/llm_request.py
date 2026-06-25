@@ -1132,6 +1132,8 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_remote_g2_plan = getattr(executor_request,
+                                            "py_remote_g2_plan", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

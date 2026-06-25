@@ -48,6 +48,10 @@ from .remote_g2_source_setup import (
 )
 
 
+_TARGET_PLAN_SERVICE_LOCK = threading.Lock()
+_TARGET_PLAN_SERVICE_PATHS: set[str] = set()
+
+
 class _TargetReqWrapper:
     """Thread-safe ZMQ REQ client to the dynamo parent's local REP bridge.
 
@@ -73,6 +77,209 @@ class _TargetReqWrapper:
             self._socket.send(pickle.dumps({"method": method, "payload": payload}))
             raw = self._socket.recv()
         return pickle.loads(raw)
+
+
+def _target_plan_ipc_socket_path(
+    dynamo_pid: int,
+    *,
+    dp_rank: int = 0,
+    kv_rank: int = 0,
+    context_qualified: bool = False,
+) -> str:
+    if context_qualified:
+        return (
+            f"/tmp/dynamo_remote_g2_target_plan_{dynamo_pid}"
+            f"_dp{dp_rank}_kv{kv_rank}.sock"
+        )
+    return f"/tmp/dynamo_remote_g2_target_plan_{dynamo_pid}.sock"
+
+
+def _start_target_plan_store_service(
+    dynamo_pid: int,
+    *,
+    dp_rank: int = 0,
+    kv_rank: int = 0,
+    context_qualified: bool = False,
+) -> Optional[str]:
+    import zmq
+
+    socket_path = _target_plan_ipc_socket_path(
+        dynamo_pid,
+        dp_rank=dp_rank,
+        kv_rank=kv_rank,
+        context_qualified=context_qualified,
+    )
+    with _TARGET_PLAN_SERVICE_LOCK:
+        if socket_path in _TARGET_PLAN_SERVICE_PATHS:
+            return socket_path
+        _TARGET_PLAN_SERVICE_PATHS.add(socket_path)
+
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+
+    ctx = zmq.Context.instance()
+    rep = ctx.socket(zmq.REP)
+    try:
+        rep.bind(f"ipc://{socket_path}")
+    except Exception:
+        with _TARGET_PLAN_SERVICE_LOCK:
+            _TARGET_PLAN_SERVICE_PATHS.discard(socket_path)
+        logging.exception(
+            "remote_g2: target plan REP bind failed at %s", socket_path
+        )
+        return None
+
+    def _loop_body() -> None:
+        while True:
+            try:
+                raw = rep.recv()
+                req = pickle.loads(raw)
+                method = req.get("method") if isinstance(req, dict) else None
+                payload = (req.get("payload") or {}) if isinstance(req, dict) else {}
+                if method == "put_plan":
+                    request_id = payload.get("request_id")
+                    plan = payload.get("plan")
+                    accepted = target_remote_g2_plan_store().put(request_id, plan)
+                    response = {"ok": True, "result": accepted is not None}
+                elif method == "discard":
+                    target_remote_g2_plan_store().discard(payload.get("request_id"))
+                    response = {"ok": True, "result": True}
+                elif method == "identify":
+                    response = {
+                        "ok": True,
+                        "result": {
+                            "pid": os.getpid(),
+                            "dp_rank": dp_rank,
+                            "kv_rank": kv_rank,
+                        },
+                    }
+                else:
+                    response = {
+                        "ok": False,
+                        "error": f"unknown method: {method!r}",
+                    }
+            except Exception as exc:
+                logging.exception("remote_g2: target plan REP dispatch raised")
+                response = {"ok": False, "error": repr(exc)}
+            try:
+                rep.send(pickle.dumps(response))
+            except Exception:
+                logging.exception("remote_g2: target plan REP send failed")
+                return
+
+    thread = threading.Thread(
+        target=_loop_body, name="remote_g2_target_plan_rep", daemon=True
+    )
+    thread.start()
+    logging.warning(
+        "remote_g2: target plan REP bound at %s dp_rank=%s kv_rank=%s",
+        socket_path,
+        dp_rank,
+        kv_rank,
+    )
+    return socket_path
+
+
+def route_remote_g2_plan_to_target_rank(
+    trtllm_request_id: int | str,
+    plan: Mapping[str, Any] | RemoteKvReusePlan,
+) -> bool:
+    """Register a remote-G2 plan in the ADP rank that will schedule it.
+
+    The submit path runs in the rank-0 Python process, but ADP strict
+    routing can schedule the request on another rank. The connector reads
+    plans from process-local state keyed by the runtime request id, so
+    rank 0 forwards the re-keyed plan to the target dp_rank process when
+    needed.
+    """
+    try:
+        parsed = (
+            plan
+            if isinstance(plan, RemoteKvReusePlan)
+            else RemoteKvReusePlan.from_dict(plan)
+        )
+    except (TypeError, ValueError):
+        logging.warning("remote_g2: invalid plan for request_id=%s", trtllm_request_id)
+        return False
+
+    store = target_remote_g2_plan_store()
+    local_dp_rank = store.target_dp_rank
+    if local_dp_rank is None or int(local_dp_rank) == int(parsed.target_dp_rank):
+        return store.put(trtllm_request_id, parsed) is not None
+
+    dynamo_pid = _walk_to_dynamo_worker_pid()
+    if dynamo_pid is None:
+        logging.warning(
+            "remote_g2: cannot route plan_id=%s to target_dp_rank=%s; "
+            "dynamo parent PID not found",
+            parsed.plan_id,
+            parsed.target_dp_rank,
+        )
+        return False
+
+    socket_path = _target_plan_ipc_socket_path(
+        dynamo_pid,
+        dp_rank=int(parsed.target_dp_rank),
+        kv_rank=0,
+        context_qualified=True,
+    )
+    if not _wait_for_socket(socket_path, timeout_s=2.0):
+        logging.warning(
+            "remote_g2: target plan socket %s missing for plan_id=%s",
+            socket_path,
+            parsed.plan_id,
+        )
+        return False
+
+    import zmq
+
+    ctx = zmq.Context.instance()
+    req = ctx.socket(zmq.REQ)
+    req.RCVTIMEO = 2000
+    req.SNDTIMEO = 2000
+    try:
+        req.connect(f"ipc://{socket_path}")
+        req.send(
+            pickle.dumps(
+                {
+                    "method": "put_plan",
+                    "payload": {
+                        "request_id": trtllm_request_id,
+                        "plan": _plan_to_dict(parsed),
+                    },
+                }
+            )
+        )
+        response = pickle.loads(req.recv())
+        if isinstance(response, dict) and response.get("ok"):
+            accepted = bool(response.get("result"))
+            logging.warning(
+                "PROBE rpc_chain route_put_plan request_id=%s plan_id=%s "
+                "local_dp_rank=%s target_dp_rank=%s accepted=%s",
+                trtllm_request_id,
+                parsed.plan_id,
+                local_dp_rank,
+                parsed.target_dp_rank,
+                accepted,
+            )
+            return accepted
+        logging.warning(
+            "remote_g2: target plan route failed for plan_id=%s response=%r",
+            parsed.plan_id,
+            response,
+        )
+        return False
+    except Exception:
+        logging.exception(
+            "remote_g2: target plan route raised for plan_id=%s socket=%s",
+            parsed.plan_id,
+            socket_path,
+        )
+        return False
+    finally:
+        req.close()
 
 
 def _plan_to_dict(plan: RemoteKvReusePlan) -> dict:
@@ -826,6 +1033,12 @@ def maybe_start_remote_g2_target_client(
     remote_g2_connector.install_resolve_and_lease(resolve_fn)
     remote_g2_connector.install_release_lease(release_fn)
     target_remote_g2_plan_store().set_target_dp_rank(dp_rank)
+    _start_target_plan_store_service(
+        dynamo_pid,
+        dp_rank=int(dp_rank or 0),
+        kv_rank=int(tp_rank),
+        context_qualified=context_qualified,
+    )
 
     # Install the block_id → primary-pool slot_idx lookup the binding
     # store uses to build NIXL local-dlist indices.

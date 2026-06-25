@@ -184,6 +184,10 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         self, request: Any, num_computed_tokens: int
     ) -> tuple[int, bool]:
         plan = self._plan_store.get(request.request_id)
+        if plan is None:
+            request_plan = getattr(request, "py_remote_g2_plan", None)
+            if request_plan is not None:
+                plan = self._plan_store.put(request.request_id, request_plan)
         resolver = self._resolve_and_lease
         import logging as _logging
         import os as _os

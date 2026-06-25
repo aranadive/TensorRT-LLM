@@ -654,6 +654,83 @@ def test_source_registry_reports_promoted_primary_from_tier_aware_lookup():
     ]
 
 
+def test_source_registry_force_offloads_primary_from_tier_aware_lookup():
+    BLOCK_SIZE_BYTES = 4096
+    WINDOW_SIZE = 4096
+
+    class FakeKv:
+        def __init__(self):
+            self.force_calls = []
+
+        def find_and_pin_blocks_by_hash(
+            self, block_hashes, window_size, tier="host_pinned", stop_on_miss=True
+        ):
+            return [
+                {
+                    "block_hash": int(block_hashes[0]),
+                    "pinned": False,
+                    "found_tier": "primary",
+                    "block_id": None,
+                    "slot_idx": None,
+                }
+            ]
+
+        def force_offload_and_pin_blocks_by_hash(self, block_hashes, window_size):
+            self.force_calls.append((list(block_hashes), window_size))
+            return [
+                {
+                    "block_hash": int(block_hash),
+                    "pinned": True,
+                    "found_tier": "host_pinned",
+                    "block_id": 200 + idx,
+                    "slot_idx": 10 + idx,
+                }
+                for idx, block_hash in enumerate(block_hashes)
+            ]
+
+    kv = FakeKv()
+    pin_refs = []
+
+    def acquire_pin(record, lease_id):
+        pin_refs.append((record.block_hash, record.block_id, record._pinned_by_lookup))
+        return record.block_id
+
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        clock_ms=lambda: 1_000,
+        acquire_pin=acquire_pin,
+        kv=kv,
+        window_size=WINDOW_SIZE,
+        pool_id="host-pool-0",
+        pool_base_ptr=1024,
+        block_size_bytes=BLOCK_SIZE_BYTES,
+        tier="host_pinned",
+    )
+
+    result = registry.resolve_and_lease(
+        _plan(
+            block_hashes=[11, 22],
+            kv_block_hashes=[101, 102],
+            planned_prefix_blocks=2,
+        )
+    )
+
+    assert result.reason == "ok"
+    assert result.lease_id is not None
+    assert [d.block_hash for d in result.descriptors] == [11, 22]
+    assert [d.byte_offset for d in result.descriptors] == [
+        10 * BLOCK_SIZE_BYTES,
+        11 * BLOCK_SIZE_BYTES,
+    ]
+    assert [(s.block_hash, s.status) for s in result.per_block_status] == [
+        (11, "live"),
+        (22, "live"),
+    ]
+    assert kv.force_calls == [([101, 102], WINDOW_SIZE)]
+    assert pin_refs == [(101, 200, True), (102, 201, True)]
+
+
 def test_remote_plan_parser_truncates_prefix_to_hash_count():
     parsed = RemoteKvReusePlan.from_dict(_plan(planned_prefix_blocks=10))
 

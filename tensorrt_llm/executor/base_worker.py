@@ -631,6 +631,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+            if self._is_pytorch_backend and _remote_g2_plan is not None:
+                executor_request.py_remote_g2_plan = _remote_g2_plan
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
@@ -657,10 +659,10 @@ class BaseWorker(GenerationExecutor):
             # connector running inside this engine subprocess reads by the
             # C++ runtime id (LlmRequest.request_id == req_id here).
             if _remote_g2_plan is not None:
-                from .._torch.pyexecutor.connectors.remote_g2 import (
-                    target_remote_g2_plan_store,
+                from .._torch.pyexecutor.connectors.remote_g2_target_setup import (
+                    route_remote_g2_plan_to_target_rank,
                 )
-                target_remote_g2_plan_store().put(req_id, _remote_g2_plan)
+                route_remote_g2_plan_to_target_rank(req_id, _remote_g2_plan)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e

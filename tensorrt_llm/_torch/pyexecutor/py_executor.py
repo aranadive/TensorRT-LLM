@@ -807,6 +807,7 @@ class PyExecutor:
                     dp_rank=rank_ctx.dp_rank,
                     context_qualified=rank_ctx.uses_context_qualified_names,
                     auto_detect_tp=False,
+                    cuda_device_id=self.device_id,
                 )
             except Exception:
                 import logging

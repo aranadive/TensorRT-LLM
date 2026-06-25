@@ -1413,6 +1413,7 @@ def maybe_start_remote_g2_service(
     dp_rank: Optional[int] = None,
     context_qualified: bool = False,
     auto_detect_tp: bool = True,
+    cuda_device_id: Optional[int] = None,
     lease_ttl_ms: int = 30_000,
     pool_id: str = "g2-host-pinned",
     tier: str = "host_pinned",
@@ -1524,6 +1525,7 @@ def maybe_start_remote_g2_service(
         pool_base_ptr=pool_base_ptr,
         block_size_bytes=block_size_bytes,
         tier=tier,
+        cuda_device_id=cuda_device_id,
     )
 
     logging.warning(

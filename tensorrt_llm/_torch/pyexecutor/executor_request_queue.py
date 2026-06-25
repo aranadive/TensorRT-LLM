@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import logging
 import queue
 import threading
 import time
@@ -95,6 +96,19 @@ class ExecutorRequestQueue:
             start_time = time.time()
             for request, query in requests_and_queries:
                 req_id = self._get_request_id(request)
+                remote_g2_plan = getattr(request, "py_remote_g2_plan", None)
+                if remote_g2_plan is not None:
+                    try:
+                        from .connectors.remote_g2_target_setup import (
+                            route_remote_g2_plan_to_target_rank,
+                        )
+                        route_remote_g2_plan_to_target_rank(req_id, remote_g2_plan)
+                    except Exception:
+                        logging.exception(
+                            "remote_g2: failed to pre-register plan "
+                            "for request_id=%s",
+                            req_id,
+                        )
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)

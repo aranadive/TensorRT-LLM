@@ -190,6 +190,11 @@ class TargetRemotePlanStore:
             self._target_dp_rank = target_dp_rank
             self._plans.clear()
 
+    @property
+    def target_dp_rank(self) -> Optional[int]:
+        with self._lock:
+            return self._target_dp_rank
+
     def put(
         self, trtllm_request_id: int | str, plan: Mapping[str, Any] | RemoteKvReusePlan
     ) -> Optional[RemoteKvReusePlan]:
@@ -896,6 +901,7 @@ class SourceG2DescriptorRegistry:
         pool_base_ptr: int = 0,
         block_size_bytes: int = 0,
         tier: str = "",
+        cuda_device_id: Optional[int] = None,
     ) -> None:
         self.source_worker_id = source_worker_id
         self.source_dp_rank = source_dp_rank
@@ -911,6 +917,7 @@ class SourceG2DescriptorRegistry:
         self._pool_base_ptr = int(pool_base_ptr)
         self._block_size_bytes = int(block_size_bytes)
         self._tier = tier
+        self._cuda_device_id = cuda_device_id
         self._records: dict[int, SourceG2DescriptorRecord] = {}
         self._leases: dict[str, RemoteG2Lease] = {}
         self._lock = threading.RLock()
@@ -997,13 +1004,53 @@ class SourceG2DescriptorRegistry:
                     for offset, lookup_result in enumerate(lookup_results):
                         current_identity_hash = int(identity_hashes[i + offset])
                         if isinstance(lookup_result, CacheMiss):
-                            status = (
-                                "promoted_primary"
-                                if lookup_result.found_tier == _CACHE_TIER_PRIMARY
-                                else "missing"
-                            )
+                            if lookup_result.found_tier == _CACHE_TIER_PRIMARY:
+                                force_results = (
+                                    self._force_offload_and_pin_blocks_by_hash(
+                                        kv_hashes[i + offset :]
+                                    )
+                                )
+                                force_pinned = 0
+                                for force_offset, force_result in enumerate(
+                                    force_results
+                                ):
+                                    force_identity_hash = int(
+                                        identity_hashes[i + offset + force_offset]
+                                    )
+                                    if isinstance(force_result, CacheMiss):
+                                        status = (
+                                            "promoted_primary"
+                                            if force_result.found_tier
+                                            == _CACHE_TIER_PRIMARY
+                                            else "missing"
+                                        )
+                                        per_block_status.append(
+                                            RemoteG2BlockStatus(
+                                                force_identity_hash, status
+                                            )
+                                        )
+                                        break
+                                    record = self._record_from_pinned_cache_block(
+                                        force_result
+                                    )
+                                    records.append(record)
+                                    per_block_status.append(
+                                        RemoteG2BlockStatus(
+                                            force_identity_hash,
+                                            "live",
+                                            record.descriptor_generation,
+                                        )
+                                    )
+                                    force_pinned += 1
+                                logging.info(
+                                    "remote_g2: resolve_and_lease force_offload "
+                                    "attempted=%d succeeded=%d",
+                                    len(kv_hashes[i + offset :]),
+                                    force_pinned,
+                                )
+                                break
                             per_block_status.append(
-                                RemoteG2BlockStatus(current_identity_hash, status)
+                                RemoteG2BlockStatus(current_identity_hash, "missing")
                             )
                             break
                         record = self._record_from_pinned_cache_block(lookup_result)
@@ -1162,6 +1209,53 @@ class SourceG2DescriptorRegistry:
             logging.exception("remote_g2: find_and_pin raised n=%d", len(lookup_hashes))
             return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
 
+        return self._cache_lookup_results_from_raw(raw_results)
+
+    def _force_offload_and_pin_blocks_by_hash(
+        self, block_hashes: tuple[int, ...]
+    ) -> list[CacheLookupResult]:
+        if self._window_size is None or self._block_size_bytes <= 0:
+            return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
+        force_offload = getattr(self._kv, "force_offload_and_pin_blocks_by_hash", None)
+        if force_offload is None:
+            return (
+                [CacheMiss(int(block_hashes[0]), _CACHE_TIER_PRIMARY)]
+                if block_hashes
+                else []
+            )
+        lookup_hashes = [int(block_hash) for block_hash in block_hashes]
+        try:
+            self._set_cuda_device_for_kv_op()
+            raw_results = force_offload(lookup_hashes, int(self._window_size))
+        except Exception:
+            logging.exception(
+                "remote_g2: force_offload_and_pin raised n=%d", len(lookup_hashes)
+            )
+            return (
+                [CacheMiss(int(block_hashes[0]), _CACHE_TIER_PRIMARY)]
+                if block_hashes
+                else []
+            )
+
+        return self._cache_lookup_results_from_raw(raw_results)
+
+    def _set_cuda_device_for_kv_op(self) -> None:
+        if self._cuda_device_id is None:
+            return
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.set_device(int(self._cuda_device_id))
+        except Exception:
+            logging.exception(
+                "remote_g2: failed to set CUDA device %s for KV op",
+                self._cuda_device_id,
+            )
+
+    def _cache_lookup_results_from_raw(
+        self, raw_results: Any
+    ) -> list[CacheLookupResult]:
         results: list[CacheLookupResult] = []
         for raw in raw_results:
             if bool(raw.get("pinned", False)):
